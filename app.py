@@ -2,17 +2,24 @@ import pandas as pd
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import re
+from google import genai
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
+import re
 import json
-from typing import List, Dict, Any, Optional
 import logging
+import mysql.connector
+from dotenv import load_dotenv
+from functools import lru_cache
+import time
 
-# Thiết lập logging để dễ dàng debug
+# Tải biến môi trường từ file .env
+load_dotenv()
+
+# Thiết lập logging
 logging.basicConfig(level=logging.INFO, 
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('movie_chatbot')
 
 # Khởi tạo ứng dụng Flask
@@ -34,7 +41,258 @@ VIETNAMESE_GENRES = [
 # Định nghĩa loại phim
 FILM_TYPES = ["Phim Lẻ", "Phim Bộ", "Phim Hoạt Hình"]
 
+# Dictionary ánh xạ tiếng Việt không dấu sang có dấu
+VIETNAMESE_MAPPING = {
+    # Thể loại phim
+    "hanh dong": "Hành Động",
+    "tinh cam": "Tình Cảm",
+    "hai huoc": "Hài Hước",
+    "kinh di": "Kinh Dị", 
+    "vien tuong": "Viễn Tưởng",
+    "phieu luu": "Phiêu Lưu",
+    "hoat hinh": "Hoạt Hình",
+    "tai lieu": "Tài Liệu",
+    "than thoai": "Thần Thoại",
+    "co trang": "Cổ Trang",
+    "hinh su": "Hình Sự",
+    "tam ly": "Tâm Lý",
+    "hoc duong": "Học Đường",
+    "vo thuat": "Võ Thuật",
+    "chien tranh": "Chiến Tranh",
+    "am nhac": "Âm Nhạc",
+    
+    # Loại phim
+    "phim le": "Phim Lẻ",
+    "phim bo": "Phim Bộ",
+    "phim hoat hinh": "Phim Hoạt Hình",
+    
+    # Ý định người dùng
+    "de xuat": "đề xuất",
+    "gioi thieu": "giới thiệu",
+    "tim kiem": "tìm kiếm",
+    "tim phim": "tìm phim",
+    "xem phim": "xem phim",
+    "thich": "thích",
+    "khong thich": "không thích",
+    "giup do": "giúp đỡ",
+}
+
+class InitDataToCSV:
+    """Chuyển đổi dữ liệu từ MySQL sang CSV."""
+    def __init__(self, db_config=None):
+        if db_config is None:
+            self.db_config = {
+                "host": os.getenv('DB_HOST', 'localhost'),
+                "user": os.getenv('DB_USER', 'root'),
+                "password": os.getenv('DB_PASSWORD', ''),
+                "database": os.getenv('DB_NAME', 'csdl_phim')
+            }
+        else:
+            self.db_config = db_config
+
+    def get_db_connection(self):
+        """Thiết lập kết nối đến cơ sở dữ liệu MySQL."""
+        try:
+            return mysql.connector.connect(**self.db_config)
+        except mysql.connector.Error as err:
+            logger.error(f"Lỗi kết nối đến cơ sở dữ liệu: {err}")
+            raise
+
+    def load_movies_data(self):
+        """Tải dữ liệu phim từ cơ sở dữ liệu MySQL."""
+        try:
+            conn = self.get_db_connection()
+            query = """
+            SELECT 
+                p.id, 
+                p.ten_phim AS title, 
+                p.slug_phim AS slug, 
+                p.hinh_anh AS hinh_anh, 
+                p.dao_dien AS director, 
+                p.quoc_gia AS country, 
+                p.nam_san_xuat AS year, 
+                lp.ten_loai_phim AS film_type,
+                MAX(p.mo_ta) AS plot, 
+                GROUP_CONCAT(DISTINCT tl.ten_the_loai SEPARATOR '|') AS genres
+            FROM 
+                phims p
+            LEFT JOIN 
+                chi_tiet_the_loais ctl ON p.id = ctl.id_phim
+            LEFT JOIN 
+                the_loais tl ON ctl.id_the_loai = tl.id
+            LEFT JOIN 
+                loai_phims lp ON p.id_loai_phim = lp.id
+            WHERE 
+                p.tinh_trang = 1
+            GROUP BY 
+                p.id, p.ten_phim
+            """
+            movies = pd.read_sql(query, conn)
+            conn.close()
+            return movies
+        except Exception as e:
+            logger.error(f"Lỗi khi tải dữ liệu phim: {e}")
+            raise
+
+    def preprocess_data(self, movies_df):
+        """Tiền xử lý dữ liệu phim cho hệ thống đề xuất."""
+        try:
+            # Điền các giá trị thiếu
+            movies_df['plot'] = movies_df['plot'].fillna('')
+            movies_df['genres'] = movies_df['genres'].fillna('')
+            movies_df['director'] = movies_df['director'].fillna('')
+            movies_df['country'] = movies_df['country'].fillna('')
+            movies_df['year'] = movies_df['year'].fillna(0)
+            movies_df['film_type'] = movies_df['film_type'].fillna('')
+            movies_df['hinh_anh'] = movies_df['hinh_anh'].fillna('')
+            movies_df['slug'] = movies_df['slug'].fillna('')
+            
+            # Chuẩn hóa đường dẫn poster
+            base_url = os.getenv('IMAGE_BASE_URL', 'http://localhost:5173/images/movies/')
+            movies_df['poster_url'] = movies_df['hinh_anh'].apply(
+                lambda x: f"{base_url}{x}" if x else f"https://via.placeholder.com/500x300?text=No+Image"
+            )
+            
+            # Tạo đặc trưng kết hợp cho tính toán độ tương đồng
+            movies_df['combined_features'] = (
+                movies_df['title'] + ' ' + 
+                movies_df['plot'] + ' ' + 
+                movies_df['genres'] + ' ' + 
+                movies_df['director'] + ' ' + 
+                movies_df['country'] + ' ' + 
+                movies_df['film_type']
+            )
+            
+            return movies_df
+        except Exception as e:
+            logger.error(f"Lỗi khi tiền xử lý dữ liệu: {e}")
+            raise
+
+    def save_to_csv(self, movies_df, output_path='vietnamese_movies.csv'):
+        """Lưu dữ liệu phim đã xử lý vào file CSV."""
+        try:
+            # Lưu vào CSV đầy đủ (bao gồm cả combined_features)
+            movies_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+            logger.info(f"Đã lưu dữ liệu thành công vào {output_path}")
+            return output_path
+        except Exception as e:
+            logger.error(f"Lỗi khi lưu vào CSV: {e}")
+            raise
+
+    def process_and_save(self, output_path='vietnamese_movies.csv', force_update=False):
+        """Phương thức chính để xử lý dữ liệu và lưu vào CSV."""
+        try:
+            # Kiểm tra file đã tồn tại và không force update
+            if os.path.exists(output_path) and not force_update:
+                logger.info(f"File CSV đã tồn tại và không yêu cầu cập nhật lại: {output_path}")
+                return output_path
+                
+            # Tải dữ liệu từ cơ sở dữ liệu
+            movies_df = self.load_movies_data()
+            logger.info(f"Đã tải {len(movies_df)} bộ phim từ cơ sở dữ liệu")
+            
+            # Tiền xử lý dữ liệu
+            processed_df = self.preprocess_data(movies_df)
+            logger.info("Đã hoàn thành tiền xử lý dữ liệu")
+            
+            # Lưu vào CSV
+            csv_path = self.save_to_csv(processed_df, output_path)
+            logger.info(f"Quá trình chuyển đổi dữ liệu thành công. File CSV: {csv_path}")
+            return csv_path
+        except Exception as e:
+            logger.error(f"Lỗi trong quá trình xử lý và lưu dữ liệu: {e}")
+            raise
+
+    @staticmethod
+    def create_sample_csv(output_path='vietnamese_movies.csv'):
+        """Tạo file CSV mẫu nếu không thể kết nối đến database."""
+        try:
+            # Tạo dữ liệu phim mẫu
+            movies_data = [
+                {
+                    "id": 1,
+                    "title": "Phim Hành Động Mẫu",
+                    "slug": "phim-hanh-dong-mau",
+                    "hinh_anh": "hanh-dong-mau.jpg",
+                    "poster_url": "https://via.placeholder.com/500x300?text=Phim+H%C3%A0nh+%C4%90%E1%BB%99ng+M%E1%BA%ABu",
+                    "director": "Đạo diễn A",
+                    "country": "Việt Nam",
+                    "year": 2023,
+                    "film_type": "Phim Lẻ",
+                    "plot": "Một bộ phim hành động gay cấn với những pha hành động mãn nhãn và tình tiết hấp dẫn.",
+                    "genres": "Hành Động|Phiêu Lưu",
+                    "combined_features": "Phim Hành Động Mẫu Một bộ phim hành động gay cấn với những pha hành động mãn nhãn và tình tiết hấp dẫn. Hành Động|Phiêu Lưu Đạo diễn A Việt Nam 2023 Phim Lẻ"
+                },
+                {
+                    "id": 2,
+                    "title": "Phim Tình Cảm Mẫu",
+                    "slug": "phim-tinh-cam-mau",
+                    "hinh_anh": "tinh-cam-mau.jpg",
+                    "poster_url": "https://via.placeholder.com/500x300?text=Phim+T%C3%ACnh+C%E1%BA%A3m+M%E1%BA%ABu",
+                    "director": "Đạo diễn B",
+                    "country": "Hàn Quốc",
+                    "year": 2022,
+                    "film_type": "Phim Bộ",
+                    "plot": "Câu chuyện tình yêu đầy cảm động giữa hai nhân vật chính với nhiều thử thách và khó khăn.",
+                    "genres": "Tình Cảm|Tâm Lý",
+                    "combined_features": "Phim Tình Cảm Mẫu Câu chuyện tình yêu đầy cảm động giữa hai nhân vật chính với nhiều thử thách và khó khăn. Tình Cảm|Tâm Lý Đạo diễn B Hàn Quốc 2022 Phim Bộ"
+                },
+                {
+                    "id": 3,
+                    "title": "Hoạt Hình Mẫu",
+                    "slug": "hoat-hinh-mau",
+                    "hinh_anh": "hoat-hinh-mau.jpg",
+                    "poster_url": "https://via.placeholder.com/500x300?text=Ho%E1%BA%A1t+H%C3%ACnh+M%E1%BA%ABu",
+                    "director": "Đạo diễn C",
+                    "country": "Nhật Bản",
+                    "year": 2021,
+                    "film_type": "Phim Hoạt Hình",
+                    "plot": "Một cuộc phiêu lưu kỳ thú trong thế giới hoạt hình với những nhân vật dễ thương và bài học ý nghĩa.",
+                    "genres": "Hoạt Hình|Gia Đình",
+                    "combined_features": "Hoạt Hình Mẫu Một cuộc phiêu lưu kỳ thú trong thế giới hoạt hình với những nhân vật dễ thương và bài học ý nghĩa. Hoạt Hình|Gia Đình Đạo diễn C Nhật Bản 2021 Phim Hoạt Hình"
+                },
+                {
+                    "id": 4,
+                    "title": "Phim Kinh Dị Mẫu",
+                    "slug": "phim-kinh-di-mau",
+                    "hinh_anh": "kinh-di-mau.jpg",
+                    "poster_url": "https://via.placeholder.com/500x300?text=Phim+Kinh+D%E1%BB%8B+M%E1%BA%ABu",
+                    "director": "Đạo diễn D",
+                    "country": "Mỹ",
+                    "year": 2020,
+                    "film_type": "Phim Lẻ",
+                    "plot": "Những sự kiện kinh hoàng diễn ra trong một ngôi nhà bỏ hoang khiến nhóm bạn trẻ phải đối mặt với nỗi sợ hãi tột cùng.",
+                    "genres": "Kinh Dị|Hồi hộp",
+                    "combined_features": "Phim Kinh Dị Mẫu Những sự kiện kinh hoàng diễn ra trong một ngôi nhà bỏ hoang khiến nhóm bạn trẻ phải đối mặt với nỗi sợ hãi tột cùng. Kinh Dị|Hồi hộp Đạo diễn D Mỹ 2020 Phim Lẻ"
+                },
+                {
+                    "id": 5,
+                    "title": "Phim Cổ Trang Mẫu",
+                    "slug": "phim-co-trang-mau",
+                    "hinh_anh": "co-trang-mau.jpg",
+                    "poster_url": "https://via.placeholder.com/500x300?text=Phim+C%E1%BB%95+Trang+M%E1%BA%ABu",
+                    "director": "Đạo diễn E",
+                    "country": "Trung Quốc",
+                    "year": 2019,
+                    "film_type": "Phim Bộ",
+                    "plot": "Câu chuyện về cuộc đời của một vị tướng tài ba trong thời loạn lạc, với những chiến công hiển hách và tình yêu sâu đậm.",
+                    "genres": "Cổ Trang|Võ Thuật|Lịch Sử",
+                    "combined_features": "Phim Cổ Trang Mẫu Câu chuyện về cuộc đời của một vị tướng tài ba trong thời loạn lạc, với những chiến công hiển hách và tình yêu sâu đậm. Cổ Trang|Võ Thuật|Lịch Sử Đạo diễn E Trung Quốc 2019 Phim Bộ"
+                }
+            ]
+            
+            # Tạo DataFrame và lưu vào CSV
+            df = pd.DataFrame(movies_data)
+            df.to_csv(output_path, index=False, encoding='utf-8-sig')
+            logger.info(f"Đã tạo file CSV mẫu với {len(df)} bộ phim tại: {output_path}")
+            return df
+        except Exception as e:
+            logger.error(f"Lỗi khi tạo file CSV mẫu: {str(e)}")
+            raise
+
+
 class MovieRecommender:
+    """Hệ thống đề xuất phim từ dữ liệu CSV."""
     def __init__(self, csv_path):
         """Khởi tạo hệ thống đề xuất phim từ file CSV."""
         self.df = self.load_and_preprocess_data(csv_path)
@@ -42,21 +300,19 @@ class MovieRecommender:
         self.features = None
         self.similarity_matrix = None
         self.create_features()
+        self.map_indices()
     
     def load_and_preprocess_data(self, csv_path):
         """Đọc file CSV và tiền xử lý dữ liệu."""
         try:
-            logger.info(f"Đang đọc dữ liệu từ {csv_path}")
+            # Kiểm tra file CSV
             if not os.path.exists(csv_path):
-                logger.error(f"File {csv_path} không tồn tại!")
-                # Tạo file mẫu nếu không tồn tại
-                self.create_sample_csv(csv_path)
-                logger.info(f"Đã tạo file mẫu {csv_path}")
+                logger.warning(f"File CSV {csv_path} không tồn tại. Tạo file mẫu.")
+                InitDataToCSV.create_sample_csv(csv_path)
                 
+            # Đọc file CSV
             df = pd.read_csv(csv_path)
             logger.info(f"Đã đọc file CSV thành công, có {len(df)} dòng dữ liệu")
-            
-            required_columns = self.check_required_columns(df)
             
             # Điền các giá trị NaN
             for col in df.columns:
@@ -65,113 +321,23 @@ class MovieRecommender:
                 else:
                     df[col] = df[col].fillna(0)
             
-            # Tạo cột đặc trưng kết hợp cho việc lọc dựa trên nội dung
-            df['combined_features'] = self.create_combined_features(df)
+            # Kiểm tra nếu chưa có cột combined_features
+            if 'combined_features' not in df.columns:
+                logger.info("Tạo cột combined_features cho phim")
+                df['combined_features'] = self.create_combined_features(df)
             
-            # In thông tin về dữ liệu
-            logger.info(f"Đã tải {len(df)} bộ phim")
-            logger.info(f"Các cột: {df.columns.tolist()}")
+            # Kiểm tra nếu chưa có cột poster_url
+            if 'poster_url' not in df.columns:
+                logger.info("Tạo cột poster_url cho phim")
+                base_url = os.getenv('IMAGE_BASE_URL', 'http://localhost:5173/images/movies/')
+                df['poster_url'] = df['hinh_anh'].apply(
+                    lambda x: f"{base_url}{x}" if x else f"https://via.placeholder.com/500x300?text=No+Image"
+                )
             
             return df
         except Exception as e:
             logger.error(f"Lỗi khi đọc dữ liệu: {str(e)}")
             raise
-    
-    def create_sample_csv(self, csv_path):
-        """Tạo file CSV mẫu nếu không tồn tại."""
-        # Tạo dữ liệu phim mẫu tiếng Việt
-        movies_data = [
-            {
-                "title": "Phim Test 1",
-                "genre": "Hành Động|Viễn Tưởng",
-                "film_type": "Phim Lẻ",
-                "director": "Đạo diễn A",
-                "actors": "Diễn viên X, Diễn viên Y",
-                "plot": "Nội dung phim test 1",
-                "year": 2021,
-                "rating": 8.5,
-                "country": "Việt Nam"
-            },
-            {
-                "title": "Phim Test 2",
-                "genre": "Tình Cảm|Hài Hước",
-                "film_type": "Phim Bộ",
-                "director": "Đạo diễn B",
-                "actors": "Diễn viên Z, Diễn viên W",
-                "plot": "Nội dung phim test 2",
-                "year": 2022,
-                "rating": 7.8,
-                "country": "Hàn Quốc"
-            },
-            {
-                "title": "Phim Test 3",
-                "genre": "Kinh Dị|Hình Sự",
-                "film_type": "Phim Lẻ",
-                "director": "Đạo diễn C",
-                "actors": "Diễn viên M, Diễn viên N",
-                "plot": "Nội dung phim test 3",
-                "year": 2023,
-                "rating": 8.2,
-                "country": "Mỹ"
-            },
-            {
-                "title": "Phim Test 4",
-                "genre": "Hoạt Hình|Gia Đình",
-                "film_type": "Phim Hoạt Hình",
-                "director": "Đạo diễn D",
-                "actors": "Lồng tiếng P, Lồng tiếng Q",
-                "plot": "Nội dung phim test 4",
-                "year": 2020,
-                "rating": 9.0,
-                "country": "Nhật Bản"
-            },
-            {
-                "title": "Phim Test 5",
-                "genre": "Cổ Trang|Võ Thuật",
-                "film_type": "Phim Bộ",
-                "director": "Đạo diễn E",
-                "actors": "Diễn viên R, Diễn viên S",
-                "plot": "Nội dung phim test 5",
-                "year": 2019,
-                "rating": 8.7,
-                "country": "Trung Quốc"
-            }
-        ]
-
-        # Tạo DataFrame từ dữ liệu
-        movies_df = pd.DataFrame(movies_data)
-
-        # Lưu vào file CSV
-        movies_df.to_csv(csv_path, index=False)
-    
-    def check_required_columns(self, df):
-        """Kiểm tra các cột cần thiết trong dataframe."""
-        required = ['title']  # Cột bắt buộc: tên phim
-        
-        # Các cột khuyến nghị
-        recommended = [
-            'genre',        # Thể loại 
-            'film_type',    # Loại phim (Phim Lẻ, Phim Bộ, Phim Hoạt Hình)
-            'director',     # Đạo diễn
-            'actors',       # Diễn viên
-            'plot',         # Nội dung
-            'year',         # Năm phát hành
-            'rating',       # Đánh giá
-            'country'       # Quốc gia
-        ]
-        
-        # Kiểm tra các cột bắt buộc
-        missing_required = [col for col in required if col not in df.columns]
-        if missing_required:
-            raise ValueError(f"Thiếu các cột bắt buộc: {missing_required}")
-        
-        # Kiểm tra các cột khuyến nghị và thêm cột rỗng nếu thiếu
-        for col in recommended:
-            if col not in df.columns:
-                logger.warning(f"Không tìm thấy cột '{col}'. Thêm cột trống.")
-                df[col] = ''
-        
-        return required + [col for col in recommended if col in df.columns]
     
     def create_combined_features(self, df):
         """Tạo chuỗi đặc trưng kết hợp cho mỗi bộ phim."""
@@ -180,38 +346,31 @@ class MovieRecommender:
         for _, row in df.iterrows():
             combined = ""
             
-            # Thêm tiêu đề (với trọng số cao hơn bằng cách lặp lại)
+            # Tạo feature với trọng số khác nhau cho các thành phần
             if 'title' in df.columns and row['title']:
-                combined += str(row['title']) + " " + str(row['title']) + " "
+                combined += f"{row['title']} {row['title']} {row['title']} "  # Trọng số cao nhất cho tiêu đề
             
-            # Thêm thể loại (với trọng số cao hơn)
             if 'genre' in df.columns and row['genre']:
-                genres = str(row['genre']).replace(',', ' ').replace('|', ' ')
-                combined += genres + " " + genres + " "
+                genres = str(row['genre']).replace('|', ' ')
+                combined += f"{genres} {genres} "  # Trọng số cao cho thể loại
             
-            # Thêm loại phim
-            if 'film_type' in df.columns and row['film_type']:
-                combined += str(row['film_type']) + " "
-            
-            # Thêm đạo diễn
-            if 'director' in df.columns and row['director']:
-                combined += str(row['director']) + " "
-            
-            # Thêm diễn viên
-            if 'actors' in df.columns and row['actors']:
-                combined += str(row['actors']).replace(',', ' ') + " "
-            
-            # Thêm cốt truyện
             if 'plot' in df.columns and row['plot']:
-                combined += str(row['plot']) + " "
-            
-            # Thêm năm
-            if 'year' in df.columns and row['year']:
-                combined += str(row['year']) + " "
-            
-            # Thêm quốc gia
+                combined += f"{row['plot']} "
+                
+            if 'director' in df.columns and row['director']:
+                combined += f"{row['director']} "
+                
+            if 'actors' in df.columns and row['actors']:
+                combined += f"{row['actors']} "
+                
+            if 'film_type' in df.columns and row['film_type']:
+                combined += f"{row['film_type']} "
+                
             if 'country' in df.columns and row['country']:
-                combined += str(row['country']) + " "
+                combined += f"{row['country']} "
+                
+            if 'year' in df.columns and row['year']:
+                combined += f"{row['year']} "
             
             features.append(combined.strip())
         
@@ -220,8 +379,19 @@ class MovieRecommender:
     def create_features(self):
         """Tạo đặc trưng TF-IDF và ma trận tương đồng."""
         try:
+            # Kiểm tra nếu 'combined_features' tồn tại trong DataFrame
+            if 'combined_features' not in self.df.columns:
+                logger.error("Cột 'combined_features' không tồn tại trong dữ liệu!")
+                # Tạo cột combined_features nếu chưa có
+                self.df['combined_features'] = self.create_combined_features(self.df)
+                
             # Tạo đặc trưng TF-IDF
             logger.info("Đang tạo đặc trưng TF-IDF...")
+            
+            # Đảm bảo combined_features là chuỗi
+            self.df['combined_features'] = self.df['combined_features'].astype(str)
+            
+            # Tính toán ma trận đặc trưng
             self.features = self.vectorizer.fit_transform(self.df['combined_features'])
             
             # Tính toán ma trận tương đồng
@@ -234,16 +404,49 @@ class MovieRecommender:
             logger.error(f"Lỗi khi tạo đặc trưng: {str(e)}")
             raise
     
+    def map_indices(self):
+        """Tạo ánh xạ giữa tiêu đề phim và chỉ số."""
+        try:
+            # Tạo bảng tra cứu chỉ số của phim theo tiêu đề
+            self.title_to_index = {}
+            for i, title in enumerate(self.df['title']):
+                # Bảng tra cứu chính xác
+                self.title_to_index[title.lower()] = i
+                
+                # Từng phần của tên phim (để tìm kiếm mờ)
+                words = title.lower().split()
+                for j in range(len(words)):
+                    # Tạo từ khóa tìm kiếm từ các từ liên tiếp
+                    keyword = " ".join(words[j:min(j+3, len(words))])
+                    if len(keyword) > 3 and keyword not in self.title_to_index:  # từ khóa có ít nhất 4 ký tự
+                        self.title_to_index[keyword] = i
+        except Exception as e:
+            logger.error(f"Lỗi khi tạo ánh xạ chỉ số: {str(e)}")
+            self.title_to_index = {}
+    
+    @lru_cache(maxsize=100)
     def get_movie_index(self, movie_title):
         """Lấy chỉ số của phim theo tiêu đề."""
         try:
+            # Tìm kiếm trong bảng tra cứu
+            movie_title_lower = movie_title.lower()
+            
             # Tìm kiếm chính xác
-            matches = self.df[self.df['title'].str.lower() == movie_title.lower()]
+            if movie_title_lower in self.title_to_index:
+                return self.title_to_index[movie_title_lower]
+            
+            # Tìm kiếm một phần
+            for key, index in self.title_to_index.items():
+                if movie_title_lower in key or key in movie_title_lower:
+                    return index
+            
+            # Tìm kiếm theo cách truyền thống nếu bảng tra cứu thất bại
+            matches = self.df[self.df['title'].str.lower() == movie_title_lower]
             if not matches.empty:
                 return matches.index[0]
             
-            # Nếu không tìm thấy kết quả chính xác, thử tìm kiếm một phần
-            matches = self.df[self.df['title'].str.lower().str.contains(movie_title.lower(), na=False)]
+            # Tìm kiếm một phần
+            matches = self.df[self.df['title'].str.lower().str.contains(movie_title_lower, na=False)]
             if not matches.empty:
                 return matches.index[0]
             
@@ -265,6 +468,9 @@ class MovieRecommender:
     
     def get_similar_movies(self, movie_title, top_n=5):
         """Lấy các phim tương tự dựa trên tiêu đề phim."""
+        start_time = time.time()
+        logger.info(f"Tìm phim tương tự với '{movie_title}'")
+        
         idx = self.get_movie_index(movie_title)
         if idx is None:
             logger.warning(f"Không tìm thấy phim: {movie_title}")
@@ -292,6 +498,7 @@ class MovieRecommender:
                     del movie_data['combined_features']
                 recommendations.append(movie_data)
             
+            logger.info(f"Thời gian tìm phim tương tự: {time.time() - start_time:.4f}s")
             return recommendations
         except Exception as e:
             logger.error(f"Lỗi khi lấy phim tương tự: {str(e)}")
@@ -299,6 +506,7 @@ class MovieRecommender:
     
     def get_genre_recommendations(self, genres, film_type=None, top_n=5):
         """Lấy đề xuất dựa trên thể loại và loại phim (nếu có)."""
+        start_time = time.time()
         try:
             # Đảm bảo genres là list
             if isinstance(genres, str):
@@ -317,13 +525,42 @@ class MovieRecommender:
                     if row['film_type'] != film_type:
                         continue
                 
-                movie_genres = str(row['genre']).split('|')
+                # Chuyển đổi chuỗi genre thành danh sách
+                if isinstance(row['genre'], str):
+                    movie_genres = row['genre'].split('|')
+                else:
+                    movie_genres = []
+                
                 movie_genres = [g.strip() for g in movie_genres]
                 
                 # Tính điểm trùng khớp dựa trên số lượng thể loại trùng khớp
                 match_score = len(set(genres).intersection(set(movie_genres)))
+                
                 if match_score > 0:
-                    genre_scores.append((idx, match_score))
+                    # Thêm trọng số nếu phim có rating cao
+                    rating_weight = 1.0
+                    if 'rating' in row and row['rating']:
+                        try:
+                            rating = float(row['rating'])
+                            rating_weight = 1.0 + (rating / 10.0)  # Đặt trọng số dựa trên rating
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    # Thêm trọng số nếu phim mới
+                    year_weight = 1.0
+                    current_year = 2023  # Có thể thay bằng datetime.now().year
+                    if 'year' in row and row['year']:
+                        try:
+                            year = int(row['year'])
+                            if year > 0:
+                                age = current_year - year
+                                year_weight = 1.0 + max(0, (10 - age) / 10.0)  # Phim càng mới trọng số càng cao
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    # Điểm cuối cùng = match_score * rating_weight * year_weight
+                    final_score = match_score * rating_weight * year_weight
+                    genre_scores.append((idx, final_score))
             
             # Sắp xếp theo điểm trùng khớp
             genre_scores = sorted(genre_scores, key=lambda x: x[1], reverse=True)
@@ -335,13 +572,19 @@ class MovieRecommender:
             
             # Trả về thông tin chi tiết của phim
             recommendations = []
-            for idx, _ in top_matches:
+            for idx, score in top_matches:
                 movie_data = self.df.iloc[idx].to_dict()
+                
+                # Thêm điểm tương đồng vào kết quả
+                movie_data['similarity_score'] = float(score)
+                
                 # Loại bỏ combined_features khỏi đầu ra
                 if 'combined_features' in movie_data:
                     del movie_data['combined_features']
+                
                 recommendations.append(movie_data)
             
+            logger.info(f"Thời gian tìm phim theo thể loại: {time.time() - start_time:.4f}s")
             return recommendations
         except Exception as e:
             logger.error(f"Lỗi khi lấy đề xuất theo thể loại: {str(e)}")
@@ -387,10 +630,23 @@ class MovieRecommender:
         """Lấy các phim phổ biến dựa trên đánh giá."""
         try:
             if 'rating' in self.df.columns:
-                top_movies = self.df.sort_values(by='rating', ascending=False).head(top_n)
+                # Sắp xếp theo rating nếu có
+                filtered_df = self.df[self.df['rating'].notna()]
+                if not filtered_df.empty:
+                    top_movies = filtered_df.sort_values(by='rating', ascending=False).head(top_n)
+                else:
+                    top_movies = self.df.sample(n=min(top_n, len(self.df)))
             else:
-                # Nếu không có cột đánh giá, trả về các phim ngẫu nhiên
-                top_movies = self.df.sample(n=min(top_n, len(self.df)))
+                # Nếu không có cột đánh giá, ưu tiên phim mới
+                if 'year' in self.df.columns:
+                    filtered_df = self.df[self.df['year'].notna()]
+                    if not filtered_df.empty:
+                        top_movies = filtered_df.sort_values(by='year', ascending=False).head(top_n)
+                    else:
+                        top_movies = self.df.sample(n=min(top_n, len(self.df)))
+                else:
+                    # Nếu không có thông tin gì, lấy ngẫu nhiên
+                    top_movies = self.df.sample(n=min(top_n, len(self.df)))
             
             recommendations = []
             for _, row in top_movies.iterrows():
@@ -411,80 +667,143 @@ class MovieRecommender:
             query = query.lower()
             
             # Tìm kiếm trong các cột khác nhau
-            title_matches = self.df[self.df['title'].str.lower().str.contains(query, regex=False, na=False)]
+            results = []
             
-            actor_matches = pd.DataFrame()
-            if 'actors' in self.df.columns:
-                actor_matches = self.df[self.df['actors'].str.lower().str.contains(query, regex=False, na=False)]
+            # Các cột tìm kiếm và trọng số tương ứng
+            search_columns = {
+                'title': 3.0,       # Tiêu đề có trọng số cao nhất
+                'genre': 2.0,       # Thể loại cũng quan trọng
+                'director': 1.5,    # Đạo diễn
+                'actors': 1.2,      # Diễn viên
+                'plot': 1.0,        # Nội dung
+                'country': 0.7,     # Quốc gia
+                'film_type': 0.8    # Loại phim
+            }
             
-            director_matches = pd.DataFrame()
-            if 'director' in self.df.columns:
-                director_matches = self.df[self.df['director'].str.lower().str.contains(query, regex=False, na=False)]
+            # Tìm kiếm trong từng cột và tính điểm
+            for idx, row in self.df.iterrows():
+                score = 0.0
+                matches = False
+                
+                for col, weight in search_columns.items():
+                    if col in self.df.columns and pd.notna(row[col]) and query in str(row[col]).lower():
+                        score += weight
+                        matches = True
+                
+                # Nếu có kết quả trùng khớp, thêm vào danh sách kết quả
+                if matches:
+                    movie_data = row.to_dict()
+                    movie_data['search_score'] = score
+                    
+                    # Loại bỏ combined_features khỏi đầu ra
+                    if 'combined_features' in movie_data:
+                        del movie_data['combined_features']
+                    
+                    results.append(movie_data)
             
-            genre_matches = pd.DataFrame()
-            if 'genre' in self.df.columns:
-                genre_matches = self.df[self.df['genre'].str.lower().str.contains(query, regex=False, na=False)]
+            # Sắp xếp kết quả theo điểm tìm kiếm
+            results = sorted(results, key=lambda x: x['search_score'], reverse=True)
             
-            country_matches = pd.DataFrame()
-            if 'country' in self.df.columns:
-                country_matches = self.df[self.df['country'].str.lower().str.contains(query, regex=False, na=False)]
-            
-            # Kết hợp tất cả các kết quả trùng khớp và loại bỏ trùng lặp
-            all_matches = pd.concat([title_matches, actor_matches, director_matches, genre_matches, country_matches]).drop_duplicates()
-            
-            # Sắp xếp theo đánh giá nếu có
-            if 'rating' in all_matches.columns and not all_matches.empty:
-                all_matches = all_matches.sort_values(by='rating', ascending=False)
-            
-            # Lấy top N kết quả trùng khớp
-            top_matches = all_matches.head(top_n)
-            
-            recommendations = []
-            for _, row in top_matches.iterrows():
-                movie_data = row.to_dict()
-                # Loại bỏ combined_features khỏi đầu ra
-                if 'combined_features' in movie_data:
-                    del movie_data['combined_features']
-                recommendations.append(movie_data)
-            
-            return recommendations
+            # Lấy top N kết quả
+            return results[:top_n]
         except Exception as e:
             logger.error(f"Lỗi khi tìm kiếm phim: {str(e)}")
             return []
 
 
-class MovieRecommendationChatbot:
-    def __init__(self, csv_path):
-        """Khởi tạo chatbot với hệ thống đề xuất phim."""
-        logger.info(f"Khởi tạo chatbot với dữ liệu từ {csv_path}")
+class AIMovieChatbot:
+    """Chatbot đề xuất phim thông minh sử dụng Gemini AI."""
+    def __init__(self, csv_path, api_key):
+        """Khởi tạo chatbot với hệ thống đề xuất phim và Gemini AI."""
         self.recommender = MovieRecommender(csv_path)
+        self.google_api_key = api_key
+        self.client = genai.Client(api_key=api_key)
         self.history = []
         self.user_preferences = {
-            "genres": [], 
+            "genres": [],
             "film_types": [],
-            "liked_movies": [], 
+            "liked_movies": [],
             "disliked_movies": [],
             "mentioned_movies": []
         }
+        self.conversation_context = "movie"  # movie or vip
+        
+        # Tạo prompts mẫu
+        self._create_system_prompts()
+    
+    def _create_system_prompts(self):
+        """Tạo các system prompts cho các ngữ cảnh khác nhau."""
+        # Prompt gốc cho phim
+        self.movie_system_prompt = """
+        Bạn là trợ lý đề xuất phim thông minh, chuyên giúp người dùng tìm kiếm và khám phá phim.
+        
+        Hãy trả lời chi tiết, tự nhiên và hữu ích, tránh các câu trả lời ngắn gọn một câu.
+        Khi đề xuất phim, hãy giải thích lý do tại sao bạn đề xuất các phim đó.
+        Khi nói về phim, hãy cung cấp thông tin phong phú về cốt truyện, diễn viên, đạo diễn, và đánh giá.
+        
+        Luôn trả lời bằng tiếng Việt, sử dụng ngôn ngữ thân thiện và tự nhiên.
+        Không viết quá nhiều cảm thán từ hay biểu tượng cảm xúc.
+        
+        Nếu bạn không có thông tin về một phim cụ thể, hãy nói rằng bạn không có thông tin về phim đó nhưng có thể đề xuất các phim tương tự dựa trên mô tả.
+        """
+        
+        # Prompt cho VIP
+        self.vip_system_prompt = """
+        Bạn là trợ lý tư vấn dịch vụ VIP của trang web xem phim. 
+        Nhiệm vụ của bạn là hỗ trợ người dùng về các gói dịch vụ VIP, thanh toán trả góp, và các ưu đãi đặc biệt.
+        
+        Thông tin về các gói VIP:
+        - Gói Basic: 99.000đ/tháng hoặc 990.000đ/năm (tiết kiệm 2 tháng)
+          * Xem không giới hạn tất cả phim cơ bản
+          * 1 tài khoản đăng nhập cùng lúc
+        
+        - Gói Premium: 199.000đ/tháng hoặc 1.990.000đ/năm (tiết kiệm 2 tháng)
+          * Xem không giới hạn toàn bộ thư viện phim bao gồm phim mới
+          * 2 tài khoản đăng nhập cùng lúc
+          * Chất lượng 4K Ultra HD
+        
+        - Gói Family: 299.000đ/tháng hoặc 2.990.000đ/năm (tiết kiệm 2 tháng)
+          * Tất cả tính năng của Premium
+          * 4 tài khoản đăng nhập cùng lúc
+          * Kiểm soát phụ huynh
+        
+        Thông tin về trả góp:
+        - Áp dụng cho đăng ký gói năm với các thẻ tín dụng hỗ trợ
+        - Kỳ hạn: 3 tháng (lãi suất 0%), 6/9/12 tháng (lãi suất 5%)
+        - Ngân hàng hỗ trợ: Vietcombank, Techcombank, BIDV, VPBank
+        
+        Hãy trả lời chi tiết, cung cấp thông tin đầy đủ và giải thích rõ ràng.
+        Luôn định dạng câu trả lời rõ ràng với các phần riêng biệt và dễ đọc.
+        """
     
     def process_message(self, message):
-        """Xử lý tin nhắn của người dùng và tạo phản hồi."""
+        """Xử lý tin nhắn người dùng và tạo phản hồi thông minh."""
         try:
-            logger.info(f"Xử lý tin nhắn: {message}")
-            # Thêm tin nhắn người dùng vào lịch sử
+            # Lưu tin nhắn vào lịch sử
             self.history.append({"role": "user", "content": message})
             
-            # Trích xuất ý định và thực thể từ tin nhắn
-            intent = self.extract_intent(message)
-            entities = self.extract_entities(message)
+            # Phân tích ý định của tin nhắn
+            intent_analysis = self._analyze_intent(message)
+            intent_type = intent_analysis.get("intent_type", "chat")
             
-            logger.info(f"Ý định: {intent}")
-            logger.info(f"Thực thể: {entities}")
+            # Cập nhật ngữ cảnh dựa trên ý định
+            if intent_type in ["vip", "subscription", "payment"]:
+                self.conversation_context = "vip"
+            elif intent_type in ["movie", "recommendation", "search"]:
+                self.conversation_context = "movie"
             
-            # Tạo phản hồi dựa trên ý định
-            response = self.generate_response(intent, entities, message)
+            logger.info(f"Đã phân tích ý định: {intent_type}, ngữ cảnh: {self.conversation_context}")
             
-            # Thêm phản hồi của bot vào lịch sử
+            # Tạo phản hồi dựa trên ngữ cảnh
+            if self.conversation_context == "vip":
+                response = self._handle_vip_context(message, intent_analysis)
+            else:  # movie context
+                response = self._handle_movie_context(message, intent_analysis)
+            
+            # Cập nhật sở thích người dùng từ phân tích ý định
+            self._update_user_preferences(intent_analysis)
+            
+            # Lưu phản hồi vào lịch sử
             self.history.append({"role": "assistant", "content": response})
             
             return response
@@ -494,413 +813,586 @@ class MovieRecommendationChatbot:
             self.history.append({"role": "assistant", "content": error_msg})
             return error_msg
     
-    def extract_intent(self, message):
-        """Trích xuất ý định của người dùng từ tin nhắn."""
-        message = message.lower()
-        
-        # Kiểm tra xem tin nhắn chỉ chứa tên thể loại không
-        for genre in VIETNAMESE_GENRES:
-            genre_lower = genre.lower()
-            if message == genre_lower or message == f"phim {genre_lower}":
-                if genre not in self.user_preferences["genres"]:
-                    self.user_preferences["genres"].append(genre)
-                return "recommend"
-        
-        # Kiểm tra loại phim
-        for film_type in FILM_TYPES:
-            if message == film_type.lower():
-                if film_type not in self.user_preferences["film_types"]:
-                    self.user_preferences["film_types"].append(film_type)
-                return "recommend"
-        
-        # Kiểm tra các ý định khác
-        if re.search(r'đề xuất|gợi ý|giới thiệu|tư vấn|recommend|suggest|show|cho.*xem|xem.*phim', message):
-            return "recommend"
-        elif re.search(r'thích|yêu thích|like|love|enjoy|favorite', message):
-            return "like"
-        elif re.search(r'không thích|ghét|dislike|hate|don\'t like', message):
-            return "dislike"
-        elif re.search(r'tìm|kiếm|search|find|looking for', message):
-            return "search"
-        elif re.search(r'giúp|trợ giúp|help|how can you|what can you do', message):
-            return "help"
-        else:
-            return "chat"
-    
-    def extract_entities(self, message):
-        """Trích xuất thực thể như tiêu đề phim, thể loại và loại phim từ tin nhắn."""
-        entities = {
-            "movie_title": None,
-            "genres": [],
-            "film_type": None
-        }
-        
-        message_lower = message.lower()
-        
-        # Trích xuất tiêu đề phim - tìm kiếm dấu ngoặc kép hoặc từ khóa phim/film
-        title_match = re.search(r'"([^"]+)"|\'([^\']+)\'|phim "([^"]+)"|film "([^"]+)"', message)
-        if title_match:
-            # Lấy nhóm đầu tiên không rỗng
-            for group in title_match.groups():
-                if group:
-                    entities["movie_title"] = group
-                    break
-        
-        # Trích xuất thể loại
-        for genre in VIETNAMESE_GENRES:
-            if re.search(r'\b' + genre.lower() + r'\b', message_lower):
-                entities["genres"].append(genre)
-        
-        # Trích xuất loại phim
-        for film_type in FILM_TYPES:
-            if re.search(r'\b' + film_type.lower() + r'\b', message_lower):
-                entities["film_type"] = film_type
-                break
-        
-        return entities
-    
-    def generate_response(self, intent, entities, original_message):
-        """Tạo phản hồi dựa trên ý định và thực thể."""
-        if intent == "recommend":
-            return self._handle_recommendation(entities)
-        elif intent == "like":
-            return self._handle_like(entities)
-        elif intent == "dislike":
-            return self._handle_dislike(entities)
-        elif intent == "search":
-            return self._handle_search(original_message)
-        elif intent == "help":
-            return self._handle_help()
-        else:
-            return self._handle_chat(original_message)
-    
-    def _handle_recommendation(self, entities):
-        """Xử lý yêu cầu đề xuất."""
-        # Cập nhật sở thích thể loại nếu có
-        if entities["genres"]:
-            for genre in entities["genres"]:
-                if genre not in self.user_preferences["genres"]:
-                    self.user_preferences["genres"].append(genre)
-        
-        # Cập nhật loại phim nếu có
-        if entities["film_type"] and entities["film_type"] not in self.user_preferences["film_types"]:
-            self.user_preferences["film_types"].append(entities["film_type"])
-        
-        if entities["movie_title"]:
-            # Cập nhật danh sách phim đã đề cập
-            if entities["movie_title"] not in self.user_preferences.get("mentioned_movies", []):
-                self.user_preferences["mentioned_movies"] = self.user_preferences.get("mentioned_movies", [])
-                self.user_preferences["mentioned_movies"].append(entities["movie_title"])
+    def _analyze_intent(self, message):
+        """Phân tích ý định của tin nhắn người dùng sử dụng Gemini."""
+        try:
+            # Xử lý trực tiếp một số trường hợp đặc biệt
+            message_lower = message.lower()
             
-            # Đề xuất dựa trên phim
-            recommendations = self.recommender.get_recommendations(movie_title=entities["movie_title"])
-            if recommendations:
-                response = f"Dựa trên phim \"{entities['movie_title']}\", tôi đề xuất cho bạn các phim sau:\n\n"
-                for i, movie in enumerate(recommendations, 1):
-                    title = movie.get('title', 'Không có tiêu đề')
-                    genre = movie.get('genre', 'Không có thể loại')
-                    film_type = movie.get('film_type', '')
-                    year = movie.get('year', '')
-                    rating = movie.get('rating', '')
-                    
-                    response += f"{i}. {title}"
-                    if year:
-                        response += f" ({year})"
-                    if film_type:
-                        response += f" - {film_type}"
-                    if genre:
-                        response += f" - {genre}"
-                    if rating:
-                        response += f" - Đánh giá: {rating}/10"
-                    response += "\n"
-                
-                response += "\nBạn có thích một trong những đề xuất này không?"
-                return response
+            # Kiểm tra tiếng Việt không dấu
+            for non_accent, with_accent in VIETNAMESE_MAPPING.items():
+                if non_accent in message_lower:
+                    message = message.replace(non_accent, with_accent)
+                    break
+            
+            # Kiểm tra các từ khóa VIP
+            vip_keywords = ["vip", "gói", "đăng ký", "subscription", "thanh toán", "trả góp", "payment"]
+            movie_keywords = ["phim", "film", "movie", "xem", "đề xuất", "thể loại", "recommend"]
+            
+            # Xác định cơ bản về intent_type
+            if any(keyword in message_lower for keyword in vip_keywords):
+                intent_type = "vip"
+            elif any(keyword in message_lower for keyword in movie_keywords):
+                intent_type = "movie"
             else:
-                return f"Xin lỗi, tôi không tìm thấy phim \"{entities['movie_title']}\" trong cơ sở dữ liệu của mình. Bạn có thể thử một bộ phim khác không?"
-        
-        elif entities["genres"]:
-            # Đề xuất dựa trên thể loại và loại phim (nếu có)
-            recommendations = self.recommender.get_genre_recommendations(
-                entities["genres"], 
-                entities["film_type"]
+                intent_type = "chat"
+            
+            # Sử dụng Gemini cho phân tích chi tiết
+            prompt = f"""
+            Phân tích ngắn gọn ý định và các thực thể quan trọng trong tin nhắn sau:
+            
+            "{message}"
+            
+            Dựa trên phân tích, hãy trả về thông tin dưới dạng JSON với cấu trúc:
+            {{
+              "intent_type": "movie/vip/chat",
+              "specific_intent": "recommend/search/like/dislike/info/subscribe/payment/general",
+              "entities": {{
+                "movie_title": "tên phim nếu có hoặc null",
+                "genres": ["thể loại 1", "thể loại 2"] hoặc [],
+                "film_type": "loại phim nếu có hoặc null",
+                "vip_package": "gói VIP nếu có hoặc null"
+              }},
+              "user_sentiment": "positive/negative/neutral",
+              "expected_response": "Mô tả ngắn về loại câu trả lời mong đợi"
+            }}
+            
+            Chỉ trả về JSON, không thêm giải thích.
+            """
+            
+            # Gọi Gemini API
+            response = self.client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt
             )
             
-            genres_text = ", ".join(entities["genres"])
-            film_type_text = f" thuộc loại {entities['film_type']}" if entities["film_type"] else ""
+            # Trích xuất JSON từ phản hồi
+            json_result = self._extract_json_from_text(response.text)
             
-            if recommendations:
-                response = f"Dựa trên thể loại {genres_text}{film_type_text}, tôi đề xuất cho bạn các phim sau:\n\n"
-                for i, movie in enumerate(recommendations, 1):
-                    title = movie.get('title', 'Không có tiêu đề')
-                    genre = movie.get('genre', 'Không có thể loại')
-                    film_type = movie.get('film_type', '')
-                    year = movie.get('year', '')
-                    rating = movie.get('rating', '')
-                    
-                    response += f"{i}. {title}"
-                    if year:
-                        response += f" ({year})"
-                    if film_type:
-                        response += f" - {film_type}"
-                    if genre:
-                        response += f" - {genre}"
-                    if rating:
-                        response += f" - Đánh giá: {rating}/10"
-                    response += "\n"
-                
-                response += "\nBạn có thích một trong những đề xuất này không?"
-                return response
-            else:
-                return f"Xin lỗi, tôi không tìm thấy phim nào thuộc thể loại {genres_text}{film_type_text} trong cơ sở dữ liệu của mình. Bạn có thể thử thể loại khác không?"
-        
-        elif entities["film_type"]:
-            # Đề xuất dựa trên loại phim
-            recommendations = self.recommender.get_film_type_recommendations(entities["film_type"])
+            # Nếu không thể trích xuất JSON, trả về kết quả cơ bản
+            if not json_result:
+                return {
+                    "intent_type": intent_type,
+                    "specific_intent": "general",
+                    "entities": {
+                        "movie_title": None,
+                        "genres": [],
+                        "film_type": None,
+                        "vip_package": None
+                    }
+                }
             
-            if recommendations:
-                response = f"Dựa trên loại {entities['film_type']}, tôi đề xuất cho bạn các phim sau:\n\n"
-                for i, movie in enumerate(recommendations, 1):
-                    title = movie.get('title', 'Không có tiêu đề')
-                    genre = movie.get('genre', 'Không có thể loại')
-                    year = movie.get('year', '')
-                    rating = movie.get('rating', '')
-                    
-                    response += f"{i}. {title}"
-                    if year:
-                        response += f" ({year})"
-                    if genre:
-                        response += f" - {genre}"
-                    if rating:
-                        response += f" - Đánh giá: {rating}/10"
-                    response += "\n"
-                
-                response += "\nBạn có thích một trong những đề xuất này không?"
-                return response
-            else:
-                return f"Xin lỗi, tôi không tìm thấy phim nào thuộc loại {entities['film_type']} trong cơ sở dữ liệu của mình. Bạn có thể thử loại phim khác không?"
+            return json_result
+        except Exception as e:
+            logger.error(f"Lỗi khi phân tích ý định: {str(e)}")
+            return {
+                "intent_type": "chat",
+                "specific_intent": "general",
+                "entities": {
+                    "movie_title": None,
+                    "genres": [],
+                    "film_type": None
+                }
+            }
+    
+    def _handle_movie_context(self, message, intent_analysis):
+        """Xử lý tin nhắn trong ngữ cảnh phim."""
+        specific_intent = intent_analysis.get("specific_intent", "general")
+        entities = intent_analysis.get("entities", {})
         
+        # Kiểm tra từng intent cụ thể
+        if specific_intent == "recommend":
+            return self._generate_recommendations(entities)
+        elif specific_intent == "search":
+            return self._handle_search(message, entities)
+        elif specific_intent == "like":
+            return self._handle_like(entities)
+        elif specific_intent == "dislike":
+            return self._handle_dislike(entities)
         else:
-            # Nếu không có tiêu chí cụ thể, đề xuất phim phổ biến hoặc dựa trên sở thích người dùng
+            # Chat thông thường với Gemini
+            return self._generate_movie_chat_response(message)
+    
+    def _handle_vip_context(self, message, intent_analysis):
+        """Xử lý tin nhắn trong ngữ cảnh VIP."""
+        # Tạo prompt cho Gemini với thông tin VIP
+        recent_history = self._get_recent_conversation_history(5)
+        
+        prompt = f"""
+        {self.vip_system_prompt}
+        
+        Lịch sử cuộc trò chuyện gần đây:
+        {recent_history}
+        
+        Tin nhắn của người dùng: "{message}"
+        
+        Hãy trả lời bằng định dạng Markdown.
+        """
+        
+        # Gọi Gemini API
+        response = self.client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
+        )
+        
+        return response.text
+    
+    def _generate_recommendations(self, entities):
+        """Tạo đề xuất phim dựa trên phân tích ý định."""
+        movie_title = entities.get("movie_title")
+        genres = entities.get("genres", [])
+        film_type = entities.get("film_type")
+        
+        # Cập nhật sở thích
+        for genre in genres:
+            if genre and genre not in self.user_preferences["genres"]:
+                self.user_preferences["genres"].append(genre)
+        
+        if film_type and film_type not in self.user_preferences["film_types"]:
+            self.user_preferences["film_types"].append(film_type)
+        
+        # Lấy đề xuất từ recommender
+        if movie_title:
+            recommendations = self.recommender.get_recommendations(movie_title=movie_title)
+            source_text = f"phim \"{movie_title}\""
+        elif genres:
+            recommendations = self.recommender.get_genre_recommendations(genres, film_type)
+            genres_text = ", ".join(genres)
+            film_type_text = f" thuộc {film_type}" if film_type else ""
+            source_text = f"thể loại {genres_text}{film_type_text}"
+        elif film_type:
+            recommendations = self.recommender.get_film_type_recommendations(film_type)
+            source_text = f"{film_type}"
+        else:
+            # Sử dụng sở thích người dùng
             if self.user_preferences["genres"]:
-                film_type = None
-                if self.user_preferences["film_types"]:
-                    film_type = self.user_preferences["film_types"][-1]
-                    
-                recommendations = self.recommender.get_genre_recommendations(
-                    self.user_preferences["genres"], 
-                    film_type
-                )
-                
-                genres_text = ", ".join(self.user_preferences["genres"])
-                film_type_text = f" thuộc loại {film_type}" if film_type else ""
-                source = f"thể loại yêu thích của bạn ({genres_text}{film_type_text})"
-                
-            elif self.user_preferences["film_types"]:
-                film_type = self.user_preferences["film_types"][-1]
-                recommendations = self.recommender.get_film_type_recommendations(film_type)
-                source = f"loại phim yêu thích của bạn ({film_type})"
-                
-            elif self.user_preferences["liked_movies"] and len(self.user_preferences["liked_movies"]) > 0:
-                # Sử dụng phim được yêu thích gần đây nhất
-                recommendations = self.recommender.get_recommendations(
-                    movie_title=self.user_preferences["liked_movies"][-1]
-                )
-                source = f"phim bạn đã thích (\"{self.user_preferences['liked_movies'][-1]}\")"
-            
+                recommendations = self.recommender.get_genre_recommendations(self.user_preferences["genres"])
+                source_text = f"sở thích của bạn (thể loại {', '.join(self.user_preferences['genres'])})"
+            elif self.user_preferences["liked_movies"]:
+                movie_title = self.user_preferences["liked_movies"][0]
+                recommendations = self.recommender.get_recommendations(movie_title=movie_title)
+                source_text = f"phim bạn đã thích (\"{movie_title}\")"
             else:
                 recommendations = self.recommender.get_popular_movies()
-                source = "các phim phổ biến"
-            
-            if recommendations:
-                response = f"Dựa trên {source}, tôi đề xuất cho bạn các phim sau:\n\n"
-                for i, movie in enumerate(recommendations, 1):
-                    title = movie.get('title', 'Không có tiêu đề')
-                    genre = movie.get('genre', 'Không có thể loại')
-                    film_type = movie.get('film_type', '')
-                    year = movie.get('year', '')
-                    rating = movie.get('rating', '')
-                    
-                    response += f"{i}. {title}"
-                    if year:
-                        response += f" ({year})"
-                    if film_type:
-                        response += f" - {film_type}"
-                    if genre:
-                        response += f" - {genre}"
-                    if rating:
-                        response += f" - Đánh giá: {rating}/10"
-                    response += "\n"
-                
-                response += "\nBạn có thích một trong những đề xuất này không?"
-                return response
-            else:
-                return "Xin lỗi, tôi không thể đưa ra đề xuất nào vào lúc này. Bạn có thể cho tôi biết bạn thích thể loại phim nào hoặc một bộ phim bạn đã thích không?"
+                source_text = "các phim phổ biến"
+        
+        # Tạo câu trả lời Markdown
+        if not recommendations:
+            message = f"Xin lỗi, tôi không tìm thấy phim phù hợp với {source_text}. Bạn có thể thử các tiêu chí khác như thể loại phim cụ thể hoặc tên một bộ phim bạn đã xem và thích?"
+            return self._generate_movie_chat_response(message)
+        
+        # Format đề xuất theo định dạng Markdown
+        return self._format_recommendations_to_markdown(recommendations, source_text)
     
-    def _handle_like(self, entities):
-        """Xử lý khi người dùng thích một bộ phim."""
-        if entities["movie_title"]:
-            movie_title = entities["movie_title"]
-            
-            # Thêm vào danh sách phim đã thích nếu chưa có
-            if movie_title not in self.user_preferences["liked_movies"]:
-                self.user_preferences["liked_movies"].append(movie_title)
-            
-            # Trích xuất thể loại từ phim nếu có thể
-            idx = self.recommender.get_movie_index(movie_title)
-            if idx is not None and 'genre' in self.recommender.df.columns:
-                movie_genres = str(self.recommender.df.iloc[idx]['genre']).split('|')
-                movie_genres = [g.strip() for g in movie_genres]
-                
-                # Cập nhật sở thích thể loại của người dùng
-                for genre in movie_genres:
-                    if genre and genre not in self.user_preferences["genres"]:
-                        self.user_preferences["genres"].append(genre)
-            
-            # Lấy đề xuất dựa trên phim này
-            recommendations = self.recommender.get_recommendations(movie_title=movie_title)
-            
-            if recommendations:
-                response = f"Tôi rất vui khi bạn thích \"{movie_title}\"! Dựa trên bộ phim này, bạn có thể thích:\n\n"
-                for i, movie in enumerate(recommendations[:3], 1):
-                    title = movie.get('title', 'Không có tiêu đề')
-                    genre = movie.get('genre', 'Không có thể loại')
-                    film_type = movie.get('film_type', '')
-                    year = movie.get('year', '')
-                    
-                    response += f"{i}. {title}"
-                    if year:
-                        response += f" ({year})"
-                    if film_type:
-                        response += f" - {film_type}"
-                    if genre:
-                        response += f" - {genre}"
-                    response += "\n"
-                
-                return response
-            else:
-                return f"Tôi đã ghi nhận rằng bạn thích \"{movie_title}\". Tôi sẽ sử dụng thông tin này để đưa ra đề xuất tốt hơn trong tương lai."
-        else:
-            return "Tôi rất vui khi bạn thích nó! Bạn có thể cho tôi biết tên phim cụ thể mà bạn đã thích không?"
-    
-    def _handle_dislike(self, entities):
-        """Xử lý khi người dùng không thích một bộ phim."""
-        if entities["movie_title"]:
-            movie_title = entities["movie_title"]
-            
-            # Thêm vào danh sách phim không thích
-            if movie_title not in self.user_preferences["disliked_movies"]:
-                self.user_preferences["disliked_movies"].append(movie_title)
-            
-            # Xóa khỏi danh sách phim đã thích nếu có
-            if movie_title in self.user_preferences["liked_movies"]:
-                self.user_preferences["liked_movies"].remove(movie_title)
-            
-            return f"Tôi đã ghi nhận rằng bạn không thích \"{movie_title}\". Tôi sẽ tránh đề xuất phim tương tự trong tương lai. Bạn có thể cho tôi biết loại phim bạn thích không?"
-        else:
-            return "Tôi xin lỗi nếu đề xuất của tôi không phù hợp. Bạn có thể cho tôi biết tên phim cụ thể mà bạn không thích không? Hoặc cho tôi biết bạn thích loại phim nào?"
-    
-    def _handle_search(self, message):
-        """Xử lý yêu cầu tìm kiếm."""
-        # Trích xuất truy vấn tìm kiếm
-        search_query = re.sub(r'tìm|kiếm|search for|looking for|find|search', '', message, flags=re.IGNORECASE).strip()
+    def _handle_search(self, message, entities):
+        """Xử lý yêu cầu tìm kiếm phim."""
+        # Trích xuất từ khóa tìm kiếm từ tin nhắn
+        search_query = message.lower()
+        for term in ["tìm", "kiếm", "search", "find", "looking for", "tìm kiếm"]:
+            search_query = search_query.replace(term, "")
+        
+        search_query = search_query.strip()
+        
+        if not search_query and entities.get("movie_title"):
+            search_query = entities["movie_title"]
         
         if not search_query:
-            return "Bạn muốn tìm kiếm phim gì? Hãy cho tôi biết tên phim, diễn viên, đạo diễn hoặc thể loại bạn quan tâm."
+            return "Bạn muốn tìm kiếm phim gì? Hãy cho tôi biết tên phim, diễn viên, đạo diễn hoặc thể loại."
         
         # Thực hiện tìm kiếm
         results = self.recommender.search_movies(search_query)
         
-        if results:
-            response = f"Đây là kết quả tìm kiếm cho \"{search_query}\":\n\n"
-            for i, movie in enumerate(results, 1):
+        if not results:
+            no_results_message = f"Tôi không tìm thấy kết quả nào cho '{search_query}'. Bạn có thể thử tìm kiếm với từ khóa khác hoặc cho tôi biết thể loại phim bạn thích."
+            return self._generate_movie_chat_response(no_results_message)
+        
+        # Format kết quả tìm kiếm
+        response = f"# Kết Quả Tìm Kiếm: '{search_query}'\n\n"
+        
+        for movie in results:
+            title = movie.get('title', 'Không có tiêu đề')
+            response += f"## {title}\n\n"
+            
+            # Thêm thông tin phim
+            if movie.get('year'):
+                response += f"* **Năm phát hành**: {movie.get('year')}\n"
+            
+            genre_info = []
+            if movie.get('genre'):
+                genre_info.append(f"**Thể loại**: {movie.get('genre')}")
+            if movie.get('film_type'):
+                genre_info.append(f"**Loại phim**: {movie.get('film_type')}")
+            if genre_info:
+                response += f"* {' | '.join(genre_info)}\n"
+            
+            if movie.get('director'):
+                response += f"* **Đạo diễn**: {movie.get('director')}\n"
+                
+            if movie.get('plot'):
+                response += f"* **Tóm tắt phim**: {movie.get('plot')}\n"
+            
+            # Thêm đường dẫn
+            safe_title = title.replace(' ', '-').lower()
+            response += f"* **Đường dẫn**: http://localhost:5173/{safe_title}\n\n"
+            
+            # Thêm hình ảnh
+            image_url = movie.get('poster_url', f"https://via.placeholder.com/500x300?text={safe_title}")
+            response += f"![Hình ảnh phim {title}]({image_url})\n\n"
+            
+            response += "---\n\n"
+        
+        response += "Bạn có quan tâm đến phim nào trong số này không? Tôi có thể giúp bạn tìm hiểu thêm về bất kỳ bộ phim nào."
+        
+        return response
+    
+    def _handle_like(self, entities):
+        """Xử lý khi người dùng thích một bộ phim."""
+        movie_title = entities.get("movie_title")
+        
+        if not movie_title:
+            return "Tôi rất vui khi bạn thích! Bạn có thể cho tôi biết tên phim cụ thể mà bạn đã thích không? Điều đó sẽ giúp tôi đề xuất các phim tương tự hơn."
+        
+        # Thêm vào danh sách phim đã thích
+        if movie_title not in self.user_preferences["liked_movies"]:
+            self.user_preferences["liked_movies"].append(movie_title)
+        
+        # Trích xuất thể loại từ phim để cập nhật sở thích
+        idx = self.recommender.get_movie_index(movie_title)
+        if idx is not None:
+            try:
+                movie_row = self.recommender.df.iloc[idx]
+                if 'genre' in movie_row and movie_row['genre']:
+                    genres = str(movie_row['genre']).split('|')
+                    for genre in genres:
+                        genre = genre.strip()
+                        if genre and genre not in self.user_preferences["genres"]:
+                            self.user_preferences["genres"].append(genre)
+                
+                if 'film_type' in movie_row and movie_row['film_type']:
+                    film_type = movie_row['film_type']
+                    if film_type and film_type not in self.user_preferences["film_types"]:
+                        self.user_preferences["film_types"].append(film_type)
+            except Exception as e:
+                logger.error(f"Lỗi khi cập nhật sở thích từ phim: {str(e)}")
+        
+        # Tạo phản hồi đề xuất thêm phim tương tự
+        try:
+            # Lấy phim tương tự
+            similar_movies = self.recommender.get_recommendations(movie_title=movie_title, top_n=3)
+            
+            if not similar_movies:
+                message = f"Tôi rất vui khi bạn thích phim \"{movie_title}\"! Tôi đã ghi nhận sở thích này và sẽ sử dụng thông tin này để đưa ra đề xuất phù hợp hơn trong tương lai."
+                return self._generate_movie_chat_response(message)
+            
+            # Tạo phản hồi
+            liked_prompt = f"""
+            Người dùng vừa cho biết họ thích phim "{movie_title}". Hãy viết một đoạn phản hồi thân thiện, 
+            nói về phim đó (nếu bạn biết) và đề xuất 3 phim tương tự dưới đây. Đảm bảo đề cập đặc điểm tương đồng.
+            
+            Các phim tương tự:
+            """
+            
+            # Thêm thông tin về 3 phim tương tự
+            for movie in similar_movies:
                 title = movie.get('title', 'Không có tiêu đề')
                 genre = movie.get('genre', 'Không có thể loại')
-                film_type = movie.get('film_type', '')
-                year = movie.get('year', '')
-                director = movie.get('director', '')
-                actors = movie.get('actors', '')
+                plot = movie.get('plot', 'Không có mô tả')
                 
-                response += f"{i}. {title}"
-                if year:
-                    response += f" ({year})"
-                if film_type:
-                    response += f"\n   Loại: {film_type}"
-                if genre:
-                    response += f"\n   Thể loại: {genre}"
-                if director:
-                    response += f"\n   Đạo diễn: {director}"
-                if actors:
-                    response += f"\n   Diễn viên: {actors}"
-                response += "\n\n"
+                liked_prompt += f"- {title}: {genre}. {plot}\n"
             
-            return response
-        else:
-            return f"Xin lỗi, tôi không tìm thấy kết quả nào cho \"{search_query}\". Bạn có thể thử tìm kiếm khác không?"
+            # Gọi Gemini để có phản hồi tự nhiên hơn
+            response = self.client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=liked_prompt
+            )
+            
+            return response.text
+        except Exception as e:
+            logger.error(f"Lỗi khi tạo phản hồi thích phim: {str(e)}")
+            return f"Tôi rất vui khi bạn thích phim \"{movie_title}\"! Tôi sẽ ghi nhớ điều này để đề xuất các phim tương tự cho bạn trong tương lai."
     
-    def _handle_help(self):
-        """Xử lý yêu cầu trợ giúp."""
-        help_text = """Tôi là chatbot đề xuất phim. Đây là những gì tôi có thể làm:
-
-1. Đề xuất phim dựa trên một bộ phim bạn thích (ví dụ: "Đề xuất phim giống The Shawshank Redemption")
-2. Đề xuất phim theo thể loại (ví dụ: "Tôi muốn xem phim hành động")
-3. Đề xuất phim theo loại (ví dụ: "Cho tôi xem phim bộ")
-4. Tìm kiếm phim (ví dụ: "Tìm kiếm phim của đạo diễn A")
-5. Ghi nhận sở thích của bạn (ví dụ: "Tôi thích phim X")
-
-Các thể loại phim:
-- Viễn Tưởng, Tình Cảm, Tài Liệu, Khoa Học, Chiến Tranh
-- Âm Nhạc, Chính Kịch, Gia Đình, Thần Thoại, Bí Ẩn
-- Tâm Lý, Học Đường, Hành Động, Thể Thao, Kinh Điển
-- Hài Hước, Võ Thuật, Phim 18+, Phiêu Lưu, Cổ Trang
-- Kinh Dị, Hình Sự
-
-Các loại phim:
-- Phim Lẻ, Phim Bộ, Phim Hoạt Hình
-
-Hãy cho tôi biết bạn muốn xem loại phim nào và tôi sẽ giúp bạn tìm ra lựa chọn hoàn hảo!"""
-        return help_text
+    def _handle_dislike(self, entities):
+        """Xử lý khi người dùng không thích một bộ phim."""
+        movie_title = entities.get("movie_title")
+        
+        if not movie_title:
+            return "Tôi hiểu rằng bạn không thích phim đó. Bạn có thể cho tôi biết tên phim cụ thể để tôi có thể tránh đề xuất các phim tương tự trong tương lai không?"
+        
+        # Thêm vào danh sách phim không thích
+        if movie_title not in self.user_preferences["disliked_movies"]:
+            self.user_preferences["disliked_movies"].append(movie_title)
+        
+        # Xóa khỏi danh sách phim đã thích nếu có
+        if movie_title in self.user_preferences["liked_movies"]:
+            self.user_preferences["liked_movies"].remove(movie_title)
+        
+        dislike_prompt = f"""
+        Người dùng vừa nói họ không thích phim "{movie_title}". 
+        
+        Hãy viết một phản hồi thân thiện, thể hiện sự thấu hiểu, và đề xuất họ thử một phim hoàn toàn khác biệt.
+        Đề xuất phim thuộc thể loại khác hoặc phong cách khác, không phải phim tương tự.
+        
+        Kết thúc bằng câu hỏi về loại phim họ thực sự thích.
+        """
+        
+        # Gọi Gemini để có phản hồi tự nhiên
+        response = self.client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=dislike_prompt
+        )
+        
+        return response.text
     
-    def _handle_chat(self, message):
-        """Xử lý trò chuyện chung."""
-        # Phản hồi dựa trên quy tắc đơn giản
-        message = message.lower()
+    def _generate_movie_chat_response(self, message):
+        """Tạo phản hồi chat từ Gemini dựa trên lịch sử và sở thích."""
+        # Lấy lịch sử trò chuyện gần đây
+        recent_history = self._get_recent_conversation_history(5)
         
-        if re.search(r'(hi|hello|hey|xin chào|chào)', message):
-            return "Xin chào! Tôi là chatbot đề xuất phim. Bạn muốn xem loại phim nào hôm nay?"
+        # Tạo thông tin về sở thích người dùng
+        preferences_info = ""
+        if self.user_preferences["genres"]:
+            preferences_info += f"Thể loại yêu thích: {', '.join(self.user_preferences['genres'])}\n"
+        if self.user_preferences["film_types"]:
+            preferences_info += f"Loại phim yêu thích: {', '.join(self.user_preferences['film_types'])}\n"
+        if self.user_preferences["liked_movies"]:
+            preferences_info += f"Phim đã thích: {', '.join(self.user_preferences['liked_movies'])}\n"
+        if self.user_preferences["disliked_movies"]:
+            preferences_info += f"Phim không thích: {', '.join(self.user_preferences['disliked_movies'])}\n"
         
-        elif re.search(r'(how are you|khỏe không|thế nào)', message):
-            return "Tôi là một chatbot nên không có cảm xúc, nhưng tôi luôn sẵn sàng giúp bạn tìm phim hay! Bạn thích xem thể loại phim nào?"
+        # Tạo prompt cho Gemini
+        prompt = f"""
+        {self.movie_system_prompt}
         
-        elif re.search(r'(thank|cảm ơn)', message):
-            return "Không có gì! Rất vui khi được giúp đỡ bạn. Bạn có muốn đề xuất thêm phim không?"
+        Thông tin về sở thích người dùng:
+        {preferences_info}
         
-        elif re.search(r'(bye|goodbye|tạm biệt)', message):
-            return "Tạm biệt! Hãy quay lại khi bạn cần đề xuất phim nhé!"
+        Lịch sử trò chuyện gần đây:
+        {recent_history}
         
-        else:
-            return "Tôi không chắc mình hiểu ý bạn. Bạn muốn tôi đề xuất phim, tìm kiếm phim, hay bạn muốn chia sẻ về một bộ phim bạn thích? Gõ 'giúp đỡ' để xem tôi có thể làm gì cho bạn."
+        Tin nhắn hiện tại của người dùng: "{message}"
+        
+        Hãy trả lời chi tiết, hữu ích và tự nhiên. Nếu thích hợp, đề xuất phim dựa trên sở thích của người dùng.
+        """
+        
+        # Gọi Gemini API
+        response = self.client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
+        )
+        
+        return response.text
+    
+    def _format_recommendations_to_markdown(self, recommendations, source_text):
+        """Format các đề xuất phim thành định dạng Markdown đẹp."""
+        # Tạo prompt cho Gemini để có giới thiệu tự nhiên
+        intro_prompt = f"""
+        Viết một đoạn văn ngắn (2-3 câu) giới thiệu về đề xuất phim dựa trên {source_text}. 
+        Đoạn văn nên thân thiện và hấp dẫn, không quá dài dòng.
+        """
+        
+        try:
+            intro_response = self.client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=intro_prompt
+            )
+            introduction = intro_response.text.strip()
+        except Exception as e:
+            logger.error(f"Lỗi khi tạo giới thiệu: {str(e)}")
+            introduction = f"Dựa trên {source_text}, tôi đã tìm ra một số phim mà bạn có thể sẽ thích:"
+        
+        # Tạo phần đầu của phản hồi
+        response = f"# Đề Xuất Phim Dựa Trên {source_text}\n\n{introduction}\n\n"
+        
+        # Thêm mỗi phim vào phản hồi
+        for movie in recommendations:
+            title = movie.get('title', 'Không có tiêu đề')
+            response += f"## {title}\n\n"
+            
+            # Thông tin phát hành
+            if movie.get('year'):
+                response += f"* **Năm phát hành**: {movie.get('year')}\n"
+            else:
+                response += f"* **Năm phát hành**: Không có thông tin\n"
+            
+            # Thể loại và loại phim
+            genre_info = []
+            if movie.get('genre'):
+                genre_info.append(f"**Thể loại**: {movie.get('genre')}")
+            if movie.get('film_type'):
+                genre_info.append(f"**Loại phim**: {movie.get('film_type')}")
+            if genre_info:
+                response += f"* {' | '.join(genre_info)}\n"
+            
+            # Đạo diễn
+            if movie.get('director'):
+                response += f"* **Đạo diễn**: {movie.get('director')}\n"
+            
+            # Tóm tắt nội dung
+            if movie.get('plot'):
+                response += f"* **Tóm tắt phim**: {movie.get('plot')}\n"
+            else:
+                response += f"* **Tóm tắt phim**: Thông tin đang được cập nhật.\n"
+            
+            # Đường dẫn
+            safe_title = title.replace(' ', '-').lower()
+            response += f"* **Đường dẫn**: http://localhost:5173/{safe_title}\n\n"
+            
+            # Hình ảnh
+            image_url = movie.get('poster_url', f"https://via.placeholder.com/500x300?text={safe_title}")
+            response += f"![Hình ảnh phim {title}]({image_url})\n\n"
+            
+            response += "---\n\n"
+        
+        # Thêm câu hỏi theo dõi
+        follow_up_prompt = f"""
+        Viết một câu hỏi theo dõi ngắn để hỏi người dùng liệu họ có hứng thú với các đề xuất phim 
+        dựa trên {source_text} không. Câu hỏi nên ngắn gọn và tự nhiên.
+        """
+        
+        try:
+            follow_up_response = self.client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=follow_up_prompt
+            )
+            follow_up = follow_up_response.text.strip()
+        except Exception as e:
+            logger.error(f"Lỗi khi tạo câu hỏi theo dõi: {str(e)}")
+            follow_up = "Bạn có thấy hứng thú với bất kỳ bộ phim nào trong số này không?"
+        
+        response += follow_up
+        
+        return response
+    
+    def _update_user_preferences(self, intent_analysis):
+        """Cập nhật sở thích người dùng từ phân tích ý định."""
+        entities = intent_analysis.get("entities", {})
+        specific_intent = intent_analysis.get("specific_intent", "")
+        
+        # Cập nhật thể loại
+        if entities.get("genres"):
+            for genre in entities["genres"]:
+                if genre and genre not in self.user_preferences["genres"]:
+                    self.user_preferences["genres"].append(genre)
+        
+        # Cập nhật loại phim
+        if entities.get("film_type") and entities["film_type"] not in self.user_preferences["film_types"]:
+            self.user_preferences["film_types"].append(entities["film_type"])
+        
+        # Cập nhật phim thích/không thích
+        if specific_intent == "like" and entities.get("movie_title"):
+            if entities["movie_title"] not in self.user_preferences["liked_movies"]:
+                self.user_preferences["liked_movies"].append(entities["movie_title"])
+        
+        elif specific_intent == "dislike" and entities.get("movie_title"):
+            if entities["movie_title"] not in self.user_preferences["disliked_movies"]:
+                self.user_preferences["disliked_movies"].append(entities["movie_title"])
+                # Xóa khỏi danh sách phim đã thích nếu có
+                if entities["movie_title"] in self.user_preferences["liked_movies"]:
+                    self.user_preferences["liked_movies"].remove(entities["movie_title"])
+    
+    def _get_recent_conversation_history(self, max_entries=5):
+        """Lấy lịch sử trò chuyện gần đây dưới dạng văn bản."""
+        if not self.history:
+            return "Chưa có lịch sử trò chuyện."
+        
+        recent_history = self.history[-min(len(self.history), max_entries*2):]
+        formatted_history = "\n".join([f"{entry['role']}: {entry['content']}" for entry in recent_history])
+        
+        return formatted_history
+    
+    def _extract_json_from_text(self, text):
+        """Trích xuất dữ liệu JSON từ văn bản."""
+        try:
+            # Tìm chuỗi JSON trong văn bản
+            json_match = re.search(r'(\{.*\})', text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+                result = json.loads(json_str)
+                return result
+            return None
+        except Exception as e:
+            logger.error(f"Lỗi khi trích xuất JSON: {str(e)}")
+            return None
 
+
+def convert_vietnamese_no_accent(text):
+    """
+    Chuyển đổi tiếng Việt không dấu sang có dấu cho các từ thông dụng.
+    """
+    # Kiểm tra text hoàn chỉnh
+    text_lower = text.lower()
+    if text_lower in VIETNAMESE_MAPPING:
+        return VIETNAMESE_MAPPING[text_lower]
+    
+    # Kiểm tra từng từ trong câu
+    words = text_lower.split()
+    result = []
+    
+    i = 0
+    while i < len(words):
+        # Kiểm tra 2-gram (cặp từ)
+        if i < len(words) - 1:
+            bigram = words[i] + " " + words[i+1]
+            if bigram in VIETNAMESE_MAPPING:
+                result.append(VIETNAMESE_MAPPING[bigram])
+                i += 2
+                continue
+                
+        # Kiểm tra 1-gram (từ đơn)
+        if words[i] in VIETNAMESE_MAPPING:
+            result.append(VIETNAMESE_MAPPING[words[i]])
+        else:
+            result.append(words[i])
+        i += 1
+    
+    return " ".join(result)
+
+
+# Khởi tạo dữ liệu
+csv_path = os.getenv('MOVIE_CSV_PATH', 'vietnamese_movies.csv')
+google_api_key = os.getenv('GOOGLE_API_KEY')
+
+# Kiểm tra API key
+if not google_api_key:
+    logger.warning("Không tìm thấy GOOGLE_API_KEY trong biến môi trường! Vui lòng đặt giá trị này để sử dụng Gemini AI.")
+
+# Thử chuyển đổi dữ liệu nếu cần
+try:
+    try_db_conversion = False  # Set to True if you want to try database conversion
+    if try_db_conversion:
+        data_converter = InitDataToCSV()
+        csv_path = data_converter.process_and_save(csv_path, force_update=False)
+        logger.info(f"Đã kiểm tra/chuyển đổi dữ liệu sang CSV: {csv_path}")
+except Exception as e:
+    logger.error(f"Lỗi khi chuyển đổi dữ liệu: {str(e)}")
+    logger.info("Sẽ sử dụng file CSV hiện có hoặc tạo file mẫu")
 
 # Khởi tạo chatbot
-csv_path = os.getenv('MOVIE_CSV_PATH', 'vietnamese_movies.csv')
 try:
-    chatbot = MovieRecommendationChatbot(csv_path)
-    logger.info("Đã khởi tạo chatbot thành công!")
+    chatbot = AIMovieChatbot(csv_path, google_api_key)
+    logger.info(f"Đã khởi tạo chatbot thành công với dữ liệu từ {csv_path}")
+    if google_api_key:
+        logger.info("Gemini AI đã được kích hoạt")
+    else:
+        logger.warning("Gemini AI không được kích hoạt do thiếu API key")
 except Exception as e:
-    error_msg = f"Lỗi khi khởi tạo chatbot: {str(e)}"
-    logger.error(error_msg)
+    logger.error(f"Lỗi khi khởi tạo chatbot: {str(e)}")
     chatbot = None
 
+
+# Định nghĩa các routes
 @app.route('/', methods=['GET'])
 def index():
     return jsonify({
         'success': True,
         'message': 'Chatbot đề xuất phim đang hoạt động!',
+        'version': '2.0.0',
         'endpoints': {
             '/chat': 'POST - Gửi tin nhắn đến chatbot',
             '/recommendations': 'GET - Lấy đề xuất phim',
-            '/search': 'GET - Tìm kiếm phim'
+            '/search': 'GET - Tìm kiếm phim',
+            '/genres': 'GET - Lấy danh sách thể loại',
+            '/film-types': 'GET - Lấy danh sách loại phim'
         }
     })
 
@@ -911,32 +1403,51 @@ def chat():
     
     try:
         global chatbot
-        # Khởi tạo lại chatbot nếu cần
+        # Kiểm tra xem chatbot đã được khởi tạo chưa
         if chatbot is None:
-            try:
-                chatbot = MovieRecommendationChatbot(csv_path)
-                logger.info("Khởi tạo lại chatbot thành công!")
-            except Exception as e:
-                return jsonify({
-                    'success': False,
-                    'error': f"Không thể khởi tạo chatbot: {str(e)}"
-                }), 500
+            return jsonify({
+                'success': False,
+                'error': 'Chatbot chưa được khởi tạo, vui lòng thử lại sau.'
+            }), 500
         
+        # Xử lý dữ liệu đầu vào
         data = request.get_json()
-        if not data or 'message' not in data:
-            return jsonify({'error': 'Không có tin nhắn được cung cấp'}), 400
+        if not data:
+            return jsonify({'error': 'Không có dữ liệu được cung cấp'}), 400
+        
+        if 'message' not in data:
+            return jsonify({'error': 'Thiếu trường "message" trong dữ liệu'}), 400
         
         user_message = data['message']
+        context = data.get('mode', 'movie')
+        
+        # Cập nhật ngữ cảnh nếu được chỉ định
+        if context == 'vip':
+            chatbot.conversation_context = 'vip'
+        elif context == 'movie':
+            chatbot.conversation_context = 'movie'
+        
+        # Xử lý tin nhắn
+        start_time = time.time()
         response = chatbot.process_message(user_message)
+        processing_time = time.time() - start_time
+        
+        # Xác định loại phản hồi (markdown hoặc html)
+        is_markdown = '# ' in response or '## ' in response
+        
+        logger.info(f"Đã xử lý tin nhắn trong {processing_time:.2f} giây, độ dài phản hồi: {len(response)}")
         
         return jsonify({
             'success': True,
             'response': response,
+            'is_markdown': is_markdown,
             'history': chatbot.history,
-            'preferences': chatbot.user_preferences
+            'context': chatbot.conversation_context,
+            'preferences': chatbot.user_preferences,
+            'processing_time': processing_time
         })
     except Exception as e:
-        logger.error(f"Lỗi khi xử lý yêu cầu: {str(e)}")
+        logger.error(f"Lỗi khi xử lý yêu cầu chat: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
@@ -946,30 +1457,29 @@ def chat():
 def get_recommendations():
     try:
         global chatbot
-        # Khởi tạo lại chatbot nếu cần
-        if chatbot is None:
-            try:
-                chatbot = MovieRecommendationChatbot(csv_path)
-                logger.info("Khởi tạo lại chatbot thành công!")
-            except Exception as e:
-                return jsonify({
-                    'success': False,
-                    'error': f"Không thể khởi tạo chatbot: {str(e)}"
-                }), 500
+        # Kiểm tra xem chatbot đã được khởi tạo chưa
+        if chatbot is None or chatbot.recommender is None:
+            return jsonify({
+                'success': False,
+                'error': 'Hệ thống đề xuất chưa được khởi tạo, vui lòng thử lại sau.'
+            }), 500
         
+        # Lấy các tham số
         movie_title = request.args.get('movie_title')
         genres = request.args.get('genres')
         film_type = request.args.get('film_type')
+        count = int(request.args.get('count', 5))
         
+        # Lấy đề xuất
         if genres:
-            genres = genres.split(',')
-            recommendations = chatbot.recommender.get_genre_recommendations(genres, film_type)
+            genres_list = genres.split(',')
+            recommendations = chatbot.recommender.get_genre_recommendations(genres_list, film_type, count)
         elif movie_title:
-            recommendations = chatbot.recommender.get_recommendations(movie_title=movie_title)
+            recommendations = chatbot.recommender.get_recommendations(movie_title=movie_title, top_n=count)
         elif film_type:
-            recommendations = chatbot.recommender.get_film_type_recommendations(film_type)
+            recommendations = chatbot.recommender.get_film_type_recommendations(film_type, count)
         else:
-            recommendations = chatbot.recommender.get_popular_movies()
+            recommendations = chatbot.recommender.get_popular_movies(count)
         
         return jsonify({
             'success': True,
@@ -986,22 +1496,19 @@ def get_recommendations():
 def search_movies():
     try:
         global chatbot
-        # Khởi tạo lại chatbot nếu cần
-        if chatbot is None:
-            try:
-                chatbot = MovieRecommendationChatbot(csv_path)
-                logger.info("Khởi tạo lại chatbot thành công!")
-            except Exception as e:
-                return jsonify({
-                    'success': False,
-                    'error': f"Không thể khởi tạo chatbot: {str(e)}"
-                }), 500
+        # Kiểm tra xem chatbot đã được khởi tạo chưa
+        if chatbot is None or chatbot.recommender is None:
+            return jsonify({
+                'success': False,
+                'error': 'Hệ thống đề xuất chưa được khởi tạo, vui lòng thử lại sau.'
+            }), 500
         
         query = request.args.get('query', '')
         if not query:
             return jsonify({'error': 'Không có truy vấn tìm kiếm được cung cấp'}), 400
         
-        results = chatbot.recommender.search_movies(query)
+        count = int(request.args.get('count', 5))
+        results = chatbot.recommender.search_movies(query, count)
         
         return jsonify({
             'success': True,
@@ -1014,11 +1521,26 @@ def search_movies():
             'error': str(e)
         }), 500
 
+@app.route('/genres', methods=['GET'])
+def get_genres():
+    """Trả về danh sách thể loại phim."""
+    return jsonify({
+        'success': True,
+        'genres': VIETNAMESE_GENRES
+    })
+
+@app.route('/film-types', methods=['GET'])
+def get_film_types():
+    """Trả về danh sách loại phim."""
+    return jsonify({
+        'success': True,
+        'film_types': FILM_TYPES
+    })
+
+# Chạy ứng dụng Flask
 if __name__ == "__main__":
-    # Đặt đường dẫn đến file CSV phim của bạn
     port = int(os.getenv('PORT', 5001))
-    logger.info(f"Khởi động ứng dụng Flask trên cổng {port}...")
+    debug = os.getenv('DEBUG', 'True').lower() in ('true', '1', 't')
+    logger.info(f"Khởi động ứng dụng Flask trên cổng {port}, debug={debug}")
     
-    # Chạy ứng dụng
-    app.run(debug=True, port=port, host='0.0.0.0')
-    logger.info("Ứng dụng Flask đã dừng.")
+    app.run(debug=debug, port=port, host='0.0.0.0', threaded=True)
