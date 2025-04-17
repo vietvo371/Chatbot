@@ -1,0 +1,6 @@
+title,genre,film_type,director,actors,plot,year,rating,country
+Phim Test 1,Hành Động|Viễn Tưởng,Phim Lẻ,Đạo diễn A,"Diễn viên X, Diễn viên Y",Nội dung phim test 1,2021,8.5,Việt Nam
+Phim Test 2,Tình Cảm|Hài Hước,Phim Bộ,Đạo diễn B,"Diễn viên Z, Diễn viên W",Nội dung phim test 2,2022,7.8,Hàn Quốc
+Phim Test 3,Kinh Dị|Hình Sự,Phim Lẻ,Đạo diễn C,"Diễn viên M, Diễn viên N",Nội dung phim test 3,2023,8.2,Mỹ
+Phim Test 4,Hoạt Hình|Gia Đình,Phim Hoạt Hình,Đạo diễn D,"Lồng tiếng P, Lồng tiếng Q",Nội dung phim test 4,2020,9.0,Nhật Bản
+Phim Test 5,Cổ Trang|Võ Thuật,Phim Bộ,Đạo diễn E,"Diễn viên R, Diễn viên S",Nội dung phim test 5,2019,8.7,Trung Quốc
