@@ -1241,7 +1241,7 @@ class AIMovieChatbot:
                 introduction = f"Tôi không tìm thấy phim nào phù hợp với {source_text}, nhưng đây là một số phim thú vị khác mà bạn có thể quan tâm:"
             
             # Format đề xuất với phần giới thiệu được tạo bởi Gemini
-            response = f"# Phim Ngẫu Nhiên Cho Bạn\n\n{introduction}\n\n"
+            response = f"# Phim Đề Xuất Cho Bạn\n\n{introduction}\n\n"
             
             # Thêm thông tin chi tiết về từng phim
             for movie in recommendations:
@@ -2536,7 +2536,7 @@ def chat():
         }), 500
 
 
-@app.route('/recommendations', methods=['GET'])
+@app.route('/recommendations', methods=['POST'])
 def get_recommendations():
     try:
         global chatbot
@@ -2547,33 +2547,37 @@ def get_recommendations():
                 'error': 'Hệ thống đề xuất chưa được khởi tạo, vui lòng thử lại sau.'
             }), 500
         
-        # Lấy và chuẩn hóa các tham số
-        movie_title = request.args.get('movie_title', '').strip()
-        film_type_param = request.args.get('film_type', '').strip()
-        genres_param = request.args.get('genres', '')
+        data = request.get_json()
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'Không có dữ liệu được cung cấp'
+            }), 400
         
-        # Xử lý film_type và genres
+        # Trích xuất các tham số từ payload JSON
+        liked_movies = data.get('liked_movies', [])
+        disliked_movies = data.get('disliked_movies', [])
+        genres_list = data.get('genres', [])
+        film_types_list = data.get('film_types', [])
+        mentioned_movies = data.get('mentioned_movies', [])
+        
+        # Xử lý film_type
         film_type = None
+        if film_types_list and len(film_types_list) > 0:
+            film_type = film_types_list[0]  # Lấy loại phim đầu tiên
+            
+            # Kiểm tra xem film_type có hợp lệ không
+            if FILM_TYPES and film_type not in FILM_TYPES:
+                # Tìm kiếm không phân biệt hoa thường
+                lower_film_types = [ft.lower() for ft in FILM_TYPES]
+                if film_type.lower() in lower_film_types:
+                    index = lower_film_types.index(film_type.lower())
+                    film_type = FILM_TYPES[index]
+        
+        # Xử lý genres
         genres = []
-        
-        # Kiểm tra xem film_type có phải là loại phim không
-        if film_type_param:
-            # Chuyển đổi sang lowercase để so sánh không phân biệt hoa thường
-            lower_film_types = [ft.lower() for ft in FILM_TYPES]
-            if film_type_param.lower() in lower_film_types:
-                # Lấy loại phim với đúng định dạng viết hoa
-                index = lower_film_types.index(film_type_param.lower())
-                film_type = FILM_TYPES[index]
-            else:
-                # Nếu film_type không phải là loại phim, xem nó như thể loại
-                genres.append(film_type_param)
-        
-        # Xử lý genres từ tham số
-        if genres_param:
-            genres.extend([g.strip() for g in genres_param.split(',') if g.strip()])
-        
-        # Loại bỏ các thể loại trùng lặp
-        genres = list(set(genres))
+        if genres_list:
+            genres = genres_list  # Sử dụng danh sách thể loại trực tiếp
         
         # Xử lý count an toàn
         count_param = request.args.get('count', '5')
@@ -2586,13 +2590,32 @@ def get_recommendations():
         count = max(1, min(count, 20))  # Giới hạn từ 1 đến 20 phim
         
         # Log thông tin tham số
-        logger.info(f"Tham số đề xuất: movie_title='{movie_title}', genres={genres}, film_type='{film_type}', count={count}")
+        logger.info(f"Tham số đề xuất: liked_movies={liked_movies}, disliked_movies={disliked_movies}, " +
+                   f"genres={genres}, film_type='{film_type}', mentioned_movies={mentioned_movies}, count={count}")
         
         # Lấy đề xuất
         recommendations = []
         
-        if movie_title:
+        # Ưu tiên theo thứ tự: phim đã đề cập > phim đã thích > thể loại > loại phim > phổ biến
+        if mentioned_movies and len(mentioned_movies) > 0:
+            # Đề xuất dựa trên phim đã đề cập gần đây nhất
+            movie_title = mentioned_movies[-1]
             recommendations = chatbot.recommender.get_recommendations(movie_title=movie_title, top_n=count)
+        # elif liked_movies and len(liked_movies) > 0:
+        #     # Đề xuất dựa trên phim đã thích gần đây nhất
+        #     movie_id = liked_movies[-1]
+        #     # Giả sử bạn có phương thức để lấy tên phim từ ID
+        #     movie = chatbot.recommender.get_movie_by_id(movie_id)
+        #     if movie and 'title' in movie:
+        #         recommendations = chatbot.recommender.get_recommendations(movie_title=movie['title'], top_n=count)
+        #     else:
+        #         # Nếu không tìm thấy phim theo ID, chuyển sang tiêu chí tiếp theo
+        #         if genres:
+        #             recommendations = chatbot.recommender.get_genre_recommendations(genres, film_type, count)
+        #         elif film_type:
+        #             recommendations = chatbot.recommender.get_film_type_recommendations(film_type, count)
+        #         else:
+        #             recommendations = chatbot.recommender.get_popular_movies(count)
         elif genres:
             recommendations = chatbot.recommender.get_genre_recommendations(genres, film_type, count)
         elif film_type:
@@ -2604,12 +2627,21 @@ def get_recommendations():
             'success': True,
             'recommendations': recommendations,
             'params': {
-                'movie_title': movie_title,
+                'liked_movies': liked_movies,
+                'disliked_movies': disliked_movies,
                 'genres': genres,
-                'film_type': film_type,
+                'film_types': film_types_list,
+                'mentioned_movies': mentioned_movies,
                 'count': count
             }
         })
+    except Exception as e:
+        logger.error(f"Lỗi khi lấy đề xuất: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
     except Exception as e:
         logger.error(f"Lỗi khi lấy đề xuất: {str(e)}")
         return jsonify({
