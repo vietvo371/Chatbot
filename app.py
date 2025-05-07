@@ -1102,6 +1102,11 @@ class AIMovieChatbot:
             - Nếu người dùng đề cập đến "phim hanh dong" nghĩa là "phim hành động"
             - Nếu người dùng đề cập đến "phim kinh di" nghĩa là "phim kinh dị"
             - Nếu người dùng đề cập đến "phim tinh cam" nghĩa là "phim tình cảm"
+            - Nếu người dùng đề cập đến "phim lẻ" nghĩa là "phim lẻ"
+            - Nếu người dùng đề cập đến "phim bo" nghĩa là "phim bộ"
+            - Nếu người dùng đề cập đến "phim hoat hinh" nghĩa là "phim hoạt hình"
+            - Phim lẻ, phim bộ, phim hoạt hình là loại phim 
+
             - Nếu người dùng nói về "vip", "gói", "thanh toán", đó là ngữ cảnh vip
 
             Trả về dưới dạng JSON:
@@ -1896,7 +1901,7 @@ def convert_vietnamese_no_accent(text):
 class UserPreferenceManager:
     """Quản lý sở thích người dùng với cơ sở dữ liệu MySQL."""
     
-    def __init__(self, db_config: Dict[str, Any], pool_size: int = 5):
+    def __init__(self, db_config: Dict[str, Any], pool_size: int = 10):  # Tăng pool size lên 10
         """Khởi tạo kết nối đến cơ sở dữ liệu."""
         self.connection_pool = pooling.MySQLConnectionPool(
             pool_name="preference_pool",
@@ -1906,7 +1911,11 @@ class UserPreferenceManager:
     
     def get_connection(self):
         """Lấy kết nối từ pool."""
-        return self.connection_pool.get_connection()
+        try:
+            return self.connection_pool.get_connection()
+        except Exception as e:
+            logger.error(f"Lỗi khi lấy kết nối từ pool: {str(e)}")
+            raise
     
     def create_session(self, ip_address: str, user_agent: str, 
                     user_id: Optional[int] = None) -> str:
@@ -1943,7 +1952,7 @@ class UserPreferenceManager:
             # Kiểm tra xem có bản tóm tắt sở thích không
             summary_query = """
             SELECT preference_data FROM user_preference_summary
-            WHERE user_id = %s OR session_id = %s
+            WHERE (user_id = %s OR session_id = %s)
             ORDER BY updated_at DESC LIMIT 1
             """
             cursor.execute(summary_query, (user_id, session_id))
@@ -1971,7 +1980,7 @@ class UserPreferenceManager:
             
             return preferences
         except Exception as e:
-            print(f"Error getting user preferences: {e}")
+            logger.error(f"Lỗi khi lấy sở thích người dùng: {str(e)}")
             return {
                 "genres": [],
                 "film_types": [],
@@ -2071,15 +2080,49 @@ class UserPreferenceManager:
         return [row['query'] for row in cursor.fetchall()]
     
     def _save_preference_summary(self, cursor, user_id, session_id, preferences):
-        """Lưu tóm tắt sở thích để truy vấn nhanh."""
-        preference_json = json.dumps(preferences)
-        
-        query = """
-        INSERT INTO user_preference_summary (user_id, session_id, preference_data)
-        VALUES (%s, %s, %s)
-        ON DUPLICATE KEY UPDATE preference_data = %s, updated_at = CURRENT_TIMESTAMP
-        """
-        cursor.execute(query, (user_id, session_id, preference_json, preference_json))
+        """Lưu tóm tắt sở thích người dùng."""
+        try:
+            # Kiểm tra user_id có tồn tại không
+            if user_id:
+                check_user_query = """
+                SELECT id FROM users WHERE id = %s
+                """
+                cursor.execute(check_user_query, (user_id,))
+                if not cursor.fetchone():
+                    user_id = None  # Set user_id thành None nếu không tồn tại
+                    logger.warning(f"User ID {user_id} không tồn tại trong bảng users, sẽ lưu với user_id = NULL")
+
+            # Xóa tóm tắt cũ
+            delete_query = """
+            DELETE FROM user_preference_summary 
+            WHERE (user_id = %s OR (user_id IS NULL AND session_id = %s))
+            """
+            cursor.execute(delete_query, (user_id, session_id))
+            
+            # Tạo tóm tắt mới
+            summary = {
+                'genres': [p['genre'] for p in preferences.get('genres', [])],
+                'film_types': [p['film_type'] for p in preferences.get('film_types', [])],
+                'liked_movies': preferences.get('liked_movies', []),
+                'disliked_movies': preferences.get('disliked_movies', []),
+                'viewed_movies': preferences.get('viewed_movies', [])
+            }
+            
+            # Lưu tóm tắt mới
+            insert_query = """
+            INSERT INTO user_preference_summary 
+            (user_id, session_id, preference_data, updated_at)
+            VALUES (%s, %s, %s, NOW())
+            """
+            cursor.execute(insert_query, (
+                user_id,  # Có thể là None
+                session_id,
+                json.dumps(summary)
+            ))
+            
+        except Exception as e:
+            logger.error(f"Lỗi khi lưu tóm tắt sở thích: {str(e)}")
+            raise
     
     def add_genre_preference(self, genre: str, user_id: Optional[int] = None, 
                         session_id: Optional[str] = None, weight: float = 1.0):
@@ -2405,31 +2448,11 @@ except Exception as e:
     chatbot = None
 app.secret_key = os.getenv('SECRET_KEY', 'dev_secret_key')  
 # Middleware để quản lý phiên
-# Middleware để quản lý phiên
 @app.before_request
 def handle_session():
-    # Kiểm tra nếu không có session_id
-    if 'session_id' not in session:
-        # Tạo phiên mới
-        ip_address = request.remote_addr
-        user_agent = request.headers.get('User-Agent', '')
-        user_id = session.get('user_id')  # None nếu chưa đăng nhập
-        
-        try:
-            if preference_manager:
-                session_id = preference_manager.create_session(ip_address, user_agent, user_id)
-                session['session_id'] = session_id
-                logger.info(f"Đã tạo phiên mới: {session_id}")
-            else:
-                # Tạo session_id giả nếu preference_manager không khả dụng
-                session_id = str(uuid.uuid4())
-                session['session_id'] = session_id
-                logger.warning(f"Đã tạo phiên giả: {session_id} (preference_manager không khả dụng)")
-        except Exception as e:
-            logger.error(f"Lỗi khi tạo phiên: {str(e)}")
-            # Tạo session_id giả trong trường hợp lỗi
-            session_id = str(uuid.uuid4())
-            session['session_id'] = session_id
+    # Không cần xử lý session nữa vì sẽ dùng localStorage
+    pass
+
 # Định nghĩa các routes
 @app.route('/', methods=['GET'])
 def index():
@@ -2471,9 +2494,15 @@ def chat():
         user_message = data['message']
         context = data.get('mode', 'movie')
         
-        # Lấy session_id từ phiên
-        session_id = session.get('session_id')
-        user_id = session.get('user_id')  # None nếu chưa đăng nhập
+        # Lấy session_id và user_id từ request data
+        session_id = data.get('session_id')
+        user_id = data.get('user_id')
+        
+        if not session_id:
+            return jsonify({
+                'success': False,
+                'error': 'Không tìm thấy session_id'
+            }), 400
         
         # Lấy sở thích người dùng từ cơ sở dữ liệu
         user_preferences = preference_manager.get_user_preferences(user_id, session_id)
@@ -2528,8 +2557,9 @@ def chat():
             'preferences': chatbot.user_preferences,
             'processing_time': processing_time
         })
+        
     except Exception as e:
-        logger.error(f"Lỗi khi xử lý yêu cầu chat: {str(e)}")
+        logger.error(f"Lỗi khi xử lý tin nhắn: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
@@ -2742,9 +2772,9 @@ def get_user_preferences():
         return '', 204
     
     try:
-        # Lấy session_id từ cookie
-        session_id = session.get('session_id')
-        user_id = session.get('user_id')  # None nếu chưa đăng nhập
+        # Lấy session_id và user_id từ query parameters
+        session_id = request.args.get('session_id')
+        user_id = request.args.get('user_id')
         
         if not session_id:
             return jsonify({
@@ -2798,6 +2828,8 @@ def movie_interaction():
         movie_id = data.get('movie_id')
         interaction_type = data.get('interaction_type')
         movie_title = data.get('movie_title')
+        session_id = data.get('session_id')
+        user_id = data.get('user_id')
         
         if not movie_id or not interaction_type:
             return jsonify({
@@ -2805,71 +2837,53 @@ def movie_interaction():
                 'error': 'Thiếu thông tin bắt buộc'
             }), 400
         
-        # Lấy session_id từ cookie
-        session_id = session.get('session_id')
-        user_id = session.get('user_id')
-        
         if not session_id:
             return jsonify({
                 'success': False,
                 'error': 'Không tìm thấy session_id'
             }), 400
+            
+        # Kiểm tra xem user_id có tồn tại trong bảng users không
+        if user_id:
+            try:
+                conn = preference_manager.get_connection()
+                cursor = conn.cursor()
+                cursor.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+                user_exists = cursor.fetchone() is not None
+                cursor.close()
+                conn.close()
+                
+                if not user_exists:
+                    user_id = None  # Nếu user không tồn tại, set user_id thành None
+            except Exception as e:
+                logger.error(f"Lỗi khi kiểm tra user: {str(e)}")
+                user_id = None
         
         # Ghi nhận tương tác
         if preference_manager:
             success = preference_manager.record_movie_interaction(
-                movie_id, interaction_type, user_id, session_id
+                movie_id=movie_id,
+                interaction_type=interaction_type,
+                user_id=user_id,  # Có thể là None nếu user không tồn tại
+                session_id=session_id
             )
             
-            # Cập nhật sở thích trong chatbot
-            if success and chatbot:
-                if interaction_type == 'like' and movie_id not in chatbot.user_preferences["liked_movies"]:
-                    chatbot.user_preferences["liked_movies"].append(movie_id)
-                    
-                    # Nếu có movie_title, thử cập nhật thể loại
-                    if movie_title:
-                        idx = chatbot.recommender.get_movie_index(movie_title)
-                        if idx is not None:
-                            try:
-                                movie_row = chatbot.recommender.df.iloc[idx]
-                                if 'genre' in movie_row and movie_row['genre']:
-                                    genres = str(movie_row['genre']).split('|')
-                                    for genre in genres:
-                                        genre = genre.strip()
-                                        if genre and genre not in chatbot.user_preferences["genres"]:
-                                            chatbot.user_preferences["genres"].append(genre)
-                                            if preference_manager:
-                                                preference_manager.add_genre_preference(genre, user_id, session_id)
-                            except Exception as e:
-                                logger.error(f"Lỗi khi cập nhật thể loại từ phim: {str(e)}")
-                
-                elif interaction_type == 'dislike':
-                    if movie_id in chatbot.user_preferences["liked_movies"]:
-                        chatbot.user_preferences["liked_movies"].remove(movie_id)
-                    if movie_id not in chatbot.user_preferences["disliked_movies"]:
-                        chatbot.user_preferences["disliked_movies"].append(movie_id)
-            
-            # Lấy sở thích cập nhật
-            preferences = preference_manager.get_user_preferences(user_id, session_id)
-            simplified_preferences = {
-                "genres": [p["genre"] for p in preferences.get("genres", [])],
-                "film_types": [p["film_type"] for p in preferences.get("film_types", [])],
-                "liked_movies": preferences.get("liked_movies", []),
-                "disliked_movies": preferences.get("disliked_movies", []),
-                "viewed_movies": preferences.get("viewed_movies", [])
-            }
-            
-            return jsonify({
-                'success': success,
-                'message': f'Đã ghi nhận tương tác {interaction_type} với phim {movie_id}',
-                'preferences': simplified_preferences
-            })
+            if success:
+                return jsonify({
+                    'success': True,
+                    'message': f'Đã ghi nhận tương tác {interaction_type} với phim {movie_title}'
+                })
+            else:
+                return jsonify({
+                    'success': False,
+                    'error': 'Không thể ghi nhận tương tác'
+                }), 500
         else:
-            # Fallback nếu không có preference_manager
             return jsonify({
                 'success': False,
                 'error': 'Hệ thống sở thích không khả dụng'
             }), 500
+            
     except Exception as e:
         logger.error(f"Lỗi khi ghi nhận tương tác: {str(e)}")
         return jsonify({
@@ -2885,6 +2899,8 @@ def remove_preference():
         data = request.get_json()
         preference_type = data.get('preference_type')
         preference_value = data.get('preference_value')
+        session_id = data.get('session_id')
+        user_id = data.get('user_id')
         
         if not preference_type or preference_value is None:
             return jsonify({
@@ -2892,56 +2908,45 @@ def remove_preference():
                 'error': 'Thiếu thông tin bắt buộc'
             }), 400
         
-        # Lấy session_id từ cookie
-        session_id = session.get('session_id')
-        user_id = session.get('user_id')
-        
         if not session_id:
             return jsonify({
                 'success': False,
                 'error': 'Không tìm thấy session_id'
             }), 400
-        
-        # Xóa sở thích
+            
+        # Xử lý xóa sở thích
         if preference_manager:
-            success = False
-            
             if preference_type == 'genre':
-                # Xóa thể loại
-                success = preference_manager.remove_genre_preference(preference_value, user_id, session_id)
-                
-                # Cập nhật chatbot
-                if success and chatbot and preference_value in chatbot.user_preferences["genres"]:
-                    chatbot.user_preferences["genres"].remove(preference_value)
+                success = preference_manager.remove_genre_preference(
+                    preference_value, user_id, session_id
+                )
+            elif preference_type == 'movie_interaction':
+                movie_id, interaction_type = preference_value.split(':')
+                success = preference_manager.remove_movie_interaction(
+                    int(movie_id), interaction_type, user_id, session_id
+                )
+            else:
+                return jsonify({
+                    'success': False,
+                    'error': 'Loại sở thích không hợp lệ'
+                }), 400
             
-            elif preference_type == 'movie':
-                # Xóa tương tác với phim
-                success = preference_manager.remove_movie_interaction(preference_value, "like", user_id, session_id)
-                
-                # Cập nhật chatbot
-                if success and chatbot and preference_value in chatbot.user_preferences["liked_movies"]:
-                    chatbot.user_preferences["liked_movies"].remove(preference_value)
-            
-            # Lấy sở thích cập nhật
-            preferences = preference_manager.get_user_preferences(user_id, session_id)
-            simplified_preferences = {
-                "genres": [p["genre"] for p in preferences.get("genres", [])],
-                "film_types": [p["film_type"] for p in preferences.get("film_types", [])],
-                "liked_movies": preferences.get("liked_movies", []),
-                "disliked_movies": preferences.get("disliked_movies", [])
-            }
-            
-            return jsonify({
-                'success': success,
-                'message': f'Đã xóa sở thích {preference_type}: {preference_value}',
-                'preferences': simplified_preferences
-            })
+            if success:
+                return jsonify({
+                    'success': True,
+                    'message': 'Đã xóa sở thích thành công'
+                })
+            else:
+                return jsonify({
+                    'success': False,
+                    'error': 'Không thể xóa sở thích'
+                }), 500
         else:
-            # Fallback nếu không có preference_manager
             return jsonify({
                 'success': False,
                 'error': 'Hệ thống sở thích không khả dụng'
             }), 500
+            
     except Exception as e:
         logger.error(f"Lỗi khi xóa sở thích: {str(e)}")
         return jsonify({
@@ -2955,74 +2960,123 @@ def update_preferences():
     if request.method == 'OPTIONS':
         return '', 204
     
+    conn = None
+    cursor = None
+    
     try:
         data = request.get_json()
         preferences = data.get('preferences')
+        session_id = data.get('session_id')
+        user_id = data.get('user_id')
+        
         if not preferences:
             return jsonify({
                 'success': False,
                 'error': 'Không có dữ liệu preferences được cung cấp'
             }), 400
             
-        # Lấy session_id và user_id từ phiên
-        session_id = session.get('session_id')
-        user_id = session.get('user_id')
-        logger.info(f"Đã nhận yêu cầu cập nhật sở thích từ user_id: {user_id}, session_id: {session_id}")
+        # Kiểm tra session_id
         if not session_id:
             return jsonify({
                 'success': False, 
                 'error': 'Không tìm thấy session_id'
             }), 400
             
+        logger.info(f"Đã nhận yêu cầu cập nhật sở thích từ user_id: {user_id}, session_id: {session_id}")
+            
         # Cập nhật sở thích vào database
         if preference_manager:
-            # Cập nhật thể loại
-            if 'genres' in preferences:
-                for genre in preferences['genres']:
-                    preference_manager.add_genre_preference(
-                        genre,
-                        user_id=user_id,
-                        session_id=session_id
-                    )
-                    
-            # Cập nhật loại phim 
-            if 'film_types' in preferences:
-                for film_type in preferences['film_types']:
-                    preference_manager.add_film_type_preference(
-                        film_type,
-                        user_id=user_id,
-                        session_id=session_id
-                    )
-                    
-            # Cập nhật phim đã thích
-            if 'liked_movies' in preferences:
-                for movie_id in preferences['liked_movies']:
-                    preference_manager.record_movie_interaction(
-                        movie_id,
-                        'like',
-                        user_id=user_id,
-                        session_id=session_id
-                    )
-                    
-            # Cập nhật phim không thích
-            if 'disliked_movies' in preferences:
-                for movie_id in preferences['disliked_movies']:
-                    preference_manager.record_movie_interaction(
-                        movie_id,
-                        'dislike',
-                        user_id=user_id, 
-                        session_id=session_id
-                    )
-            
-            # Cập nhật chatbot nếu có
-            if chatbot:
-                chatbot.user_preferences.update(preferences)
+            try:
+                conn = preference_manager.get_connection()
+                cursor = conn.cursor(dictionary=True)
                 
-            return jsonify({
-                'success': True,
-                'message': 'Đã cập nhật sở thích thành công'
-            })
-            
+                # Kiểm tra xem session có tồn tại không
+                check_session_query = """
+                SELECT id FROM sessions WHERE id = %s
+                """
+                cursor.execute(check_session_query, (session_id,))
+                session_exists = cursor.fetchone() is not None
+                
+                if not session_exists:
+                    # Kiểm tra user_id có tồn tại không nếu có user_id
+                    if user_id:
+                        check_user_query = """
+                        SELECT id FROM users WHERE id = %s
+                        """
+                        cursor.execute(check_user_query, (user_id,))
+                        user_exists = cursor.fetchone() is not None
+                        
+                        if not user_exists:
+                            user_id = None  # Set user_id thành None nếu không tồn tại
+                    
+                    # Tạo session mới nếu chưa tồn tại
+                    ip_address = request.remote_addr
+                    user_agent = request.headers.get('User-Agent', '')
+                    session_id = preference_manager.create_session(ip_address, user_agent, user_id)
+                    logger.info(f"Đã tạo session mới: {session_id}")
+                
+                # Cập nhật thể loại
+                if 'genres' in preferences:
+                    for genre in preferences['genres']:
+                        preference_manager.add_genre_preference(
+                            genre=genre,
+                            user_id=user_id,
+                            session_id=session_id
+                        )
+                
+                # Cập nhật loại phim
+                if 'film_types' in preferences:
+                    for film_type in preferences['film_types']:
+                        preference_manager.add_film_type_preference(
+                            film_type=film_type,
+                            user_id=user_id,
+                            session_id=session_id
+                        )
+                
+                # Cập nhật tương tác phim
+                if 'movie_interactions' in preferences:
+                    for interaction in preferences['movie_interactions']:
+                        preference_manager.record_movie_interaction(
+                            movie_id=interaction['movie_id'],
+                            interaction_type=interaction['type'],
+                            user_id=user_id,
+                            session_id=session_id
+                        )
+                
+                # Lấy sở thích cập nhật
+                updated_preferences = preference_manager.get_user_preferences(user_id, session_id)
+                
+                # Lưu tóm tắt sở thích
+                preference_manager._save_preference_summary(cursor, user_id, session_id, updated_preferences)
+                
+                conn.commit()
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Cập nhật sở thích thành công',
+                    'session_id': session_id,
+                    'preferences': {
+                        "genres": [p["genre"] for p in updated_preferences.get("genres", [])],
+                        "film_types": [p["film_type"] for p in updated_preferences.get("film_types", [])],
+                        "liked_movies": updated_preferences.get("liked_movies", []),
+                        "disliked_movies": updated_preferences.get("disliked_movies", []),
+                        "viewed_movies": updated_preferences.get("viewed_movies", [])
+                    }
+                })
+                
+            except Exception as e:
+                if conn:
+                    conn.rollback()
+                logger.error(f"Lỗi khi cập nhật sở thích: {str(e)}")
+                return jsonify({
+                    'success': False,
+                    'error': str(e)
+                }), 500
+            finally:
+                if cursor:
+                    cursor.close()
+                if conn:
+                    conn.close()
         else:
             return jsonify({
                 'success': False,
@@ -3030,7 +3084,7 @@ def update_preferences():
             }), 500
             
     except Exception as e:
-        logger.error(f"Lỗi khi cập nhật sở thích: {str(e)}")
+        logger.error(f"Lỗi khi xử lý yêu cầu cập nhật sở thích: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
