@@ -186,7 +186,8 @@ class InitDataToCSV:
             logger.error(f"Lỗi khi lưu vào CSV: {e}")
             raise
 
-    def process_and_save(self, output_path='vietnamese_movies.csv', force_update=False):
+    @staticmethod
+    def process_and_save(output_path='vietnamese_movies.csv', force_update=False):
         """Phương thức chính để xử lý dữ liệu và lưu vào CSV."""
         try:
             # Kiểm tra file đã tồn tại và không force update
@@ -194,18 +195,22 @@ class InitDataToCSV:
                 logger.info(f"File CSV đã tồn tại và không yêu cầu cập nhật lại: {output_path}")
                 return output_path
                 
+            # Tạo instance để sử dụng các phương thức
+            init_data = InitDataToCSV()
+            
             # Tải dữ liệu từ cơ sở dữ liệu
-            movies_df = self.load_movies_data()
+            movies_df = init_data.load_movies_data()
             logger.info(f"Đã tải {len(movies_df)} bộ phim từ cơ sở dữ liệu")
             
             # Tiền xử lý dữ liệu
-            processed_df = self.preprocess_data(movies_df)
+            processed_df = init_data.preprocess_data(movies_df)
             logger.info("Đã hoàn thành tiền xử lý dữ liệu")
             
             # Lưu vào CSV
-            csv_path = self.save_to_csv(processed_df, output_path)
+            csv_path = init_data.save_to_csv(processed_df, output_path)
             logger.info(f"Quá trình chuyển đổi dữ liệu thành công. File CSV: {csv_path}")
             return csv_path
+            
         except Exception as e:
             logger.error(f"Lỗi trong quá trình xử lý và lưu dữ liệu: {e}")
             raise
@@ -315,7 +320,7 @@ class MovieRecommender:
             # Kiểm tra file CSV
             if not os.path.exists(csv_path):
                 logger.warning(f"File CSV {csv_path} không tồn tại. Tạo file mẫu.")
-                InitDataToCSV.create_sample_csv(csv_path)
+                InitDataToCSV.process_and_save(csv_path, force_update=True)
                 
             # Đọc file CSV
             df = pd.read_csv(csv_path)
@@ -1282,7 +1287,7 @@ class AIMovieChatbot:
                     response += f"* **Đường dẫn**: http://localhost:5173/{safe_title}\n\n"
                 
                 # Hình ảnh
-                image_url = movie.get('poster_url', f"https://via.placeholder.com/500x300?text={title.replace(' ', '+')}")
+                image_url = movie.get('hinh_anh')
                 response += f"![Hình ảnh phim {title}]({image_url})\n\n"
                 
                 response += "---\n\n"
@@ -1611,7 +1616,7 @@ class AIMovieChatbot:
                 response += f"* **Đường dẫn**: http://localhost:5173/{safe_title}\n\n"
             
             # Thêm hình ảnh
-            image_url = movie.get('poster_url', f"https://via.placeholder.com/500x300?text={title.replace(' ', '+')}")
+            image_url = movie.get('poster_url')
             response += f"![Hình ảnh phim {title}]({image_url})\n\n"
             
             response += "---\n\n"
@@ -1816,7 +1821,7 @@ class AIMovieChatbot:
                 response += f"* **Đường dẫn**: http://localhost:5173/{safe_title}\n\n"
             
             # Hình ảnh
-            image_url = movie.get('poster_url', f"https://via.placeholder.com/500x300?text={title.replace(' ', '+')}")
+            image_url = movie.get('poster_url')
             response += f"![Hình ảnh phim {title}]({image_url})\n\n"
             
             response += "---\n\n"
@@ -2082,6 +2087,9 @@ class UserPreferenceManager:
     def _save_preference_summary(self, cursor, user_id, session_id, preferences):
         """Lưu tóm tắt sở thích người dùng."""
         try:
+            # Log dữ liệu đầu vào để debug
+            logger.debug(f"Dữ liệu preferences nhận được: {preferences}")
+            
             # Kiểm tra user_id có tồn tại không
             if user_id:
                 check_user_query = """
@@ -2099,14 +2107,23 @@ class UserPreferenceManager:
             """
             cursor.execute(delete_query, (user_id, session_id))
             
-            # Tạo tóm tắt mới
+            # Tạo tóm tắt mới - sử dụng trực tiếp dữ liệu từ preferences
             summary = {
-                'genres': [p['genre'] for p in preferences.get('genres', [])],
-                'film_types': [p['film_type'] for p in preferences.get('film_types', [])],
-                'liked_movies': preferences.get('liked_movies', []),
-                'disliked_movies': preferences.get('disliked_movies', []),
-                'viewed_movies': preferences.get('viewed_movies', [])
+                'genres': preferences.get('genres', []),
+                'film_types': preferences.get('film_types', []),
+                'liked_movies': [str(movie_id) for movie_id in preferences.get('liked_movies', [])],
+                'disliked_movies': [str(movie_id) for movie_id in preferences.get('disliked_movies', [])],
+                'viewed_movies': [str(movie_id) for movie_id in preferences.get('viewed_movies', [])]
             }
+            
+            # Đảm bảo tất cả các giá trị là list
+            for key in summary:
+                if not isinstance(summary[key], list):
+                    summary[key] = []
+                    logger.warning(f"Chuyển đổi {key} thành list rỗng do không phải kiểu list")
+            
+            # Log dữ liệu đã xử lý để debug
+            logger.debug(f"Dữ liệu summary sau khi xử lý: {summary}")
             
             # Lưu tóm tắt mới
             insert_query = """
@@ -2736,29 +2753,63 @@ def reset_preferences():
         reset_interactions = data.get('reset_interactions', True)
         reset_history = data.get('reset_history', True)
         
-        session_id = session.get('session_id')
-        user_id = session.get('user_id')
+        # Lấy session_id và user_id từ request body thay vì session
+        session_id = data.get('session_id')
+        user_id = data.get('user_id')
         
-        success = preference_manager.reset_preferences(
-            user_id, session_id, 
-            reset_genres, reset_film_types, 
-            reset_interactions, reset_history
-        )
+        if not session_id:
+            return jsonify({
+                'success': False,
+                'error': 'Không tìm thấy session_id'
+            }), 400
+            
+        logger.info(f"Đang reset preferences cho session_id: {session_id}, user_id: {user_id}")
         
-        # Cập nhật chatbot
-        if success:
-            chatbot.user_preferences = {
-                "genres": [],
-                "film_types": [],
-                "liked_movies": [],
-                "disliked_movies": [],
-                "mentioned_movies": []
-            }
+        # Kiểm tra session có tồn tại không
+        conn = preference_manager.get_connection()
+        cursor = conn.cursor(dictionary=True)
         
-        return jsonify({
-            'success': success,
-            'message': 'Đã đặt lại sở thích người dùng thành công' if success else 'Lỗi khi đặt lại sở thích'
-        })
+        try:
+            check_session_query = """
+            SELECT id FROM sessions 
+            WHERE id = %s AND expires_at > NOW()
+            """
+            cursor.execute(check_session_query, (session_id,))
+            session_exists = cursor.fetchone() is not None
+            
+            if not session_exists:
+                return jsonify({
+                    'success': False,
+                    'error': 'Session không tồn tại hoặc đã hết hạn'
+                }), 404
+                
+            # Thực hiện reset preferences
+            success = preference_manager.reset_preferences(
+                user_id, session_id, 
+                reset_genres, reset_film_types, 
+                reset_interactions, reset_history
+            )
+            
+            # Cập nhật chatbot
+            if success:
+                chatbot.user_preferences = {
+                    "genres": [],
+                    "film_types": [],
+                    "liked_movies": [],
+                    "disliked_movies": [],
+                    "mentioned_movies": []
+                }
+                logger.info(f"Đã reset preferences thành công cho session_id: {session_id}")
+            
+            return jsonify({
+                'success': success,
+                'message': 'Đã đặt lại sở thích người dùng thành công' if success else 'Lỗi khi đặt lại sở thích'
+            })
+            
+        finally:
+            cursor.close()
+            conn.close()
+            
     except Exception as e:
         logger.error(f"Lỗi khi đặt lại sở thích: {str(e)}")
         return jsonify({
@@ -2990,30 +3041,37 @@ def update_preferences():
                 conn = preference_manager.get_connection()
                 cursor = conn.cursor(dictionary=True)
                 
-                # Kiểm tra xem session có tồn tại không
+                # Kiểm tra xem session có tồn tại và còn hạn không
                 check_session_query = """
-                SELECT id FROM sessions WHERE id = %s
+                SELECT id, expires_at FROM sessions 
+                WHERE id = %s AND expires_at > NOW()
                 """
                 cursor.execute(check_session_query, (session_id,))
-                session_exists = cursor.fetchone() is not None
+                session_data = cursor.fetchone()
+                session_exists = session_data is not None
+                
+                logger.info(f"Kiểm tra session {session_id}: {'tồn tại' if session_exists else 'không tồn tại hoặc hết hạn'}")
                 
                 if not session_exists:
                     # Kiểm tra user_id có tồn tại không nếu có user_id
+                    user_exists = False
                     if user_id:
                         check_user_query = """
                         SELECT id FROM users WHERE id = %s
                         """
                         cursor.execute(check_user_query, (user_id,))
                         user_exists = cursor.fetchone() is not None
+                        logger.info(f"Kiểm tra user {user_id}: {'tồn tại' if user_exists else 'không tồn tại'}")
                         
                         if not user_exists:
                             user_id = None  # Set user_id thành None nếu không tồn tại
                     
-                    # Tạo session mới nếu chưa tồn tại
+                    # Tạo session mới nếu chưa tồn tại hoặc hết hạn
                     ip_address = request.remote_addr
                     user_agent = request.headers.get('User-Agent', '')
+                    old_session_id = session_id
                     session_id = preference_manager.create_session(ip_address, user_agent, user_id)
-                    logger.info(f"Đã tạo session mới: {session_id}")
+                    logger.info(f"Đã tạo session mới: {session_id} (thay thế cho session cũ: {old_session_id})")
                 
                 # Cập nhật thể loại
                 if 'genres' in preferences:
